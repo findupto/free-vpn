@@ -10,11 +10,16 @@ import threading
 import time
 import urllib.request
 import zipfile
+import winreg
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 API_URL = os.environ.get("FINDUPTO_API_URL", "https://findupto-free-vpn.onrender.com")
 VPN_GATE_URLS = ["https://www.vpngate.net/api/iphone/", "http://www.vpngate.net/api/iphone/"]
+OPENVPN_INSTALLER_URL = os.environ.get(
+    "FINDUPTO_OPENVPN_INSTALLER_URL",
+    "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi",
+)
 APP_NAME = "Findupto Free VPN"
 TUNNEL_NAME = "FinduptoVPN"
 CACHE_FILE = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Findupto", "servers.json")
@@ -40,30 +45,132 @@ def relaunch_as_admin():
 
 def _find_executable(name, folders):
     for base in folders:
+        if not base:
+            continue
         path = os.path.join(base, name)
         if os.path.isfile(path):
             return path
     return None
 
 
+def _registry_executable(value_names, default_name):
+    roots = [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]
+    subkeys = [
+        r"SOFTWARE\OpenVPN",
+        r"SOFTWARE\WOW6432Node\OpenVPN",
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OpenVPN",
+    ]
+    for root in roots:
+        for subkey in subkeys:
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    for value_name in value_names:
+                        try:
+                            value, _ = winreg.QueryValueEx(key, value_name)
+                        except OSError:
+                            continue
+                        if isinstance(value, str):
+                            candidate = value if value.lower().endswith(".exe") else os.path.join(value, default_name)
+                            if os.path.isfile(candidate):
+                                return candidate
+            except OSError:
+                continue
+    return None
+
+
 def wireguard_path():
-    return _find_executable("wireguard.exe", [
+    path = _find_executable("wireguard.exe", [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "WireGuard"),
     ])
+    if path:
+        return path
+    return _find_executable("wireguard.exe", [os.path.dirname(os.environ.get("PATH", "").split(os.pathsep)[0])]) or _which("wireguard.exe")
+
+
+def _which(name):
+    try:
+        result = subprocess.run(["where", name], capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if os.path.isfile(line.strip()):
+                    return line.strip()
+    except Exception:
+        pass
+    return None
 
 
 def openvpn_path():
-    return _find_executable("openvpn.exe", [
+    path = _find_executable("openvpn.exe", [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "OpenVPN", "bin"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "OpenVPN", "bin"),
+        os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "OpenVPN", "bin"),
     ])
+    if path:
+        return path
+    return _registry_executable(["InstallDir", "Path", "InstallLocation"], "openvpn.exe") or _which("openvpn.exe")
 
 
 def _download(url, timeout=8):
-    request = urllib.request.Request(url, headers={"User-Agent": "Findupto-Free-VPN/0.6"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Findupto-Free-VPN/0.7"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
+
+
+def _app_directory():
+    return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+
+
+def ensure_openvpn():
+    """Return a usable OpenVPN executable, installing the official MSI when needed."""
+    existing = openvpn_path()
+    if existing:
+        return existing
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("VPN connections are supported on Windows only.")
+    if not is_admin():
+        raise PermissionError("Administrator permission is required to install OpenVPN.")
+
+    installer_candidates = [
+        os.path.join(_app_directory(), "openvpn-amd64.msi"),
+        os.path.join(_app_directory(), "installer", "openvpn-amd64.msi"),
+    ]
+    installer = next((p for p in installer_candidates if os.path.isfile(p)), None)
+    temp_path = None
+    try:
+        if not installer:
+            temp_dir = tempfile.mkdtemp(prefix="findupto-openvpn-")
+            temp_path = os.path.join(temp_dir, "openvpn-amd64.msi")
+            data = _download(OPENVPN_INSTALLER_URL, timeout=30)
+            if len(data) < 1_000_000:
+                raise RuntimeError("The OpenVPN installer download was incomplete.")
+            with open(temp_path, "wb") as handle:
+                handle.write(data)
+            installer = temp_path
+
+        result = subprocess.run(
+            ["msiexec.exe", "/i", installer, "/qn", "/norestart"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode not in (0, 3010):
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"OpenVPN installation failed (code {result.returncode}). {detail}")
+
+        for _ in range(20):
+            found = openvpn_path()
+            if found:
+                return found
+            time.sleep(1)
+        raise RuntimeError("OpenVPN was installed but openvpn.exe could not be located. Please restart Windows and try again.")
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+                os.rmdir(os.path.dirname(temp_path))
+            except OSError:
+                pass
 
 
 def parse_vpngate_csv(text):
@@ -182,7 +289,7 @@ class App(tk.Tk):
 
     def build_ui(self):
         ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(self, text="Fast server discovery • OpenVPN + WireGuard • Automatic fallback").pack(anchor="w", pady=(2, 14))
+        ttk.Label(self, text="Fast server discovery • OpenVPN + WireGuard • Automatic runtime repair").pack(anchor="w", pady=(2, 14))
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True)
         columns = ("country", "city", "ip", "protocol", "ping", "speed", "source")
@@ -264,10 +371,21 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Unsupported VPN protocol: {protocol or 'unknown'}")
 
     def connect_openvpn(self, server):
-        ovpn = openvpn_path()
-        if not ovpn:
-            messagebox.showerror(APP_NAME, "OpenVPN is missing. Re-run the Findupto installer and make sure OpenVPN Community is installed.")
-            return
+        self.status.set("Checking OpenVPN runtime…")
+        threading.Thread(target=self._prepare_openvpn, args=(server,), daemon=True).start()
+
+    def _prepare_openvpn(self, server):
+        try:
+            ovpn = ensure_openvpn()
+            self.after(0, lambda: self._start_openvpn(ovpn, server))
+        except PermissionError:
+            self.after(0, lambda: messagebox.showerror(APP_NAME, "Administrator permission is required to install OpenVPN. Please run Findupto Free VPN as Administrator."))
+            self.after(0, lambda: self.status.set("OpenVPN installation needs administrator permission"))
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror(APP_NAME, f"OpenVPN could not be installed or found.\n\n{exc}"))
+            self.after(0, lambda: self.status.set("OpenVPN runtime unavailable"))
+
+    def _start_openvpn(self, ovpn, server):
         self.status.set(f"Preparing {server.get('city', 'server')}…")
         threading.Thread(target=self._openvpn_worker, args=(ovpn, server), daemon=True).start()
 
