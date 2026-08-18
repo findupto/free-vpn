@@ -1,78 +1,40 @@
 # Findupto Free VPN
 
-An open-source VPN platform designed to provide **free VPN access through community-operated WireGuard servers**.
+A Windows desktop VPN client and free-server directory focused on fast discovery, reliable connection handling, and automatic VPN runtime installation.
 
-> Important: a VPN service cannot magically create free servers in every country. Each VPN exit node needs a real machine/network with bandwidth. This project therefore uses a community model: people can contribute nodes, and the directory exposes healthy nodes to clients.
+## What is fixed
 
-## Windows desktop app
+- Server discovery uses API-side caching and client-side cache fallback instead of waiting indefinitely for a remote source.
+- External server fetches have strict timeouts and stale cached servers remain usable when the upstream source is temporarily unavailable.
+- VPN Gate OpenVPN servers are handled as OpenVPN servers instead of being incorrectly treated as WireGuard nodes.
+- The Windows installer now installs both official OpenVPN Community and WireGuard runtimes so the client does not fail because OpenVPN is missing.
+- The Windows client verifies the runtime before connecting, runs connection work off the UI thread, records OpenVPN logs, and detects when the OpenVPN process exits.
+- The installer workflow validates downloaded runtime installers and verifies that the final installer was actually created.
+- `Best Server` selects the top-ranked currently available server.
 
-The project now includes a native Windows desktop client. It runs as a normal `.exe` application and does **not** require a web browser. The installer bundles the official WireGuard for Windows MSI, creates a desktop shortcut, and installs the WireGuard networking component automatically. WireGuard supports Windows 10/11 and exposes a tunnel-service CLI that the client uses to start and stop VPN tunnels.
+The official OpenVPN Community project publishes Windows installers for Windows 10 and later. urlOpenVPN Community Downloadshttps://openvpn.net/community/
 
-The GitHub Actions workflow builds `Findupto-Free-VPN-Setup.exe` automatically. Push a `v*` tag to publish a GitHub Release containing the installer.
+## Windows client
 
-### Desktop client architecture
+Run the installer as administrator. It installs:
 
-```text
-FinduptoVPN.exe
-     |
-     | HTTPS
-     v
-Findupto API ---- healthy WireGuard nodes
-     |
-     | short-lived client config URL
-     v
-WireGuard for Windows
-     |
-     v
-VPN tunnel
-```
+- Findupto Free VPN
+- OpenVPN Community for OpenVPN servers
+- WireGuard for Windows for community WireGuard servers
 
-The client only connects to registered `wireguard` nodes that expose a `config_url`. A node registration must never contain a private WireGuard key. The config URL should issue a short-lived client configuration from trusted node infrastructure.
+The application can use either protocol based on the server record.
 
-### API URL
+## Performance
 
-The desktop client reads `FINDUPTO_API_URL` from the environment. If it is not set, it uses the configured default in `client/app.py`. For production, point this value at your HTTPS deployment of this API before distributing the installer.
+The API caches the external VPN Gate directory for 5 minutes by default and performs the blocking upstream request outside the FastAPI event loop. The desktop client also keeps a short-lived local server cache, so opening the application does not require a fresh upstream request every time.
 
-## Goals
+Environment variables:
 
-- WireGuard-first VPN networking
-- Free/community-operated servers
-- Automatic server health checks
-- Geographic server discovery
-- Short-lived client configurations
-- No third-party VPN credentials or paid VPN account scraping
-- Easy Docker deployment
-- Open API for VPN clients
-- Native Windows desktop client
-- Standalone Windows installer
+- `VPN_CACHE_TTL` — API cache lifetime in seconds; default `300`.
+- `VPN_FETCH_TIMEOUT` — API upstream timeout; default `8` seconds.
+- `FINDUPTO_API_URL` — desktop API endpoint override.
 
-## Performance improvements
-
-The API now caches the external VPN Gate directory for a short TTL and performs the blocking upstream fetch outside the FastAPI event loop. This prevents every client request from waiting on the external provider and substantially reduces repeated network latency. Community WireGuard nodes are kept in-memory and sorted deterministically for fast client discovery.
-
-## Architecture
-
-```text
-                    +----------------------+
-                    |  Findupto API        |
-                    |  server directory     |
-                    +----------+-----------+
-                               |
-                 health checks | node metadata
-                               v
-        +----------------------+----------------------+
-        |                      |                      |
-   WireGuard Node         WireGuard Node         WireGuard Node
-     USA / Dallas          Germany / Frankfurt      Singapore
-        |                      |                      |
-        +----------------------+----------------------+
-                               |
-                         FinduptoVPN.exe
-                               |
-                         WireGuard Windows
-```
-
-## Quick start
+## Development
 
 ### API
 
@@ -80,43 +42,28 @@ The API now caches the external VPN Gate directory for a short TTL and performs 
 docker compose up --build
 ```
 
-The API will be available on `http://localhost:8080`.
-
-### Windows client development
+### Windows client
 
 ```powershell
 pip install -r client/requirements.txt
+pip install pyinstaller
 pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/app.py
 ```
 
-The generated executable is `dist/FinduptoVPN.exe`.
+### Installer
 
-### Windows installer
+The GitHub Actions workflow builds the EXE, downloads the official OpenVPN Community and WireGuard Windows installers, validates them, and creates `Findupto-Free-VPN-Setup.exe` with Inno Setup.
 
-The GitHub Actions workflow builds a standalone installer with Inno Setup and bundles the official WireGuard AMD64 MSI. The installer requires administrator privileges because a VPN tunnel driver/service must be installed at the Windows system level.
-
-## Add a community node
-
-Each contributor runs WireGuard on a VPS, home server, Raspberry Pi, or other suitable host and registers only the public endpoint and public key with the directory. Never submit a private WireGuard key. For desktop-client connectivity, provide a `config_url` that returns a short-lived client WireGuard configuration.
-
-The included registry API accepts node metadata and health status. A production deployment should put it behind HTTPS, authentication/rate limiting, and a persistent database.
-
-## Free-server strategy
-
-The project does not claim that every country will always have a free node. Availability depends on volunteers and free-tier infrastructure. The directory can aggregate nodes from many independent operators and automatically remove unhealthy nodes.
-
-Potential infrastructure sources include legitimate free tiers, donated VPS capacity, universities/community networks where permitted, and volunteer hardware. Always follow the provider's acceptable-use policy and bandwidth limits.
+Push a `v*` tag to publish the installer as a GitHub Release.
 
 ## Security
 
-- Never commit private keys.
-- Generate WireGuard keys locally on the client/node.
-- Use HTTPS for the registry API and config endpoints.
+- Never commit private WireGuard keys.
+- Use HTTPS for API and configuration endpoints.
+- Treat public/community VPN nodes as untrusted exit points.
 - Do not log user traffic.
 - Keep node registration authenticated in production.
-- Rotate node/client credentials.
-- Prefer short-lived client configurations.
-- Treat community nodes as untrusted exit points.
+- Prefer short-lived WireGuard client configurations.
 
 ## License
 
