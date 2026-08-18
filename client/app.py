@@ -1,4 +1,6 @@
 import ctypes
+import csv
+import io
 import json
 import os
 import subprocess
@@ -7,11 +9,11 @@ import tempfile
 import threading
 import urllib.request
 import zipfile
-import io
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 API_URL = os.environ.get("FINDUPTO_API_URL", "https://findupto-free-vpn.onrender.com")
+VPN_GATE_CSV = "https://www.vpngate.net/api/iphone/"
 APP_NAME = "Findupto Free VPN"
 TUNNEL_NAME = "FinduptoVPN"
 
@@ -27,8 +29,13 @@ def relaunch_as_admin():
     if is_admin():
         return True
     try:
-        params = " ".join(f'"{arg}"' for arg in sys.argv)
-        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        executable = sys.executable
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
+        else:
+            params = " ".join(f'"{arg}"' for arg in sys.argv)
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
         return result > 32
     except Exception:
         return False
@@ -57,13 +64,64 @@ def openvpn_path():
 
 
 def fetch_servers():
-    url = API_URL.rstrip("/") + "/api/v1/public/servers?limit=50"
-    with urllib.request.urlopen(url, timeout=15) as response:
-        return json.loads(response.read().decode("utf-8"))
+    """Use our API when deployed; fall back directly to VPN Gate so the desktop app
+    still works when the optional Findupto API is offline/not deployed yet."""
+    api_error = None
+    try:
+        url = API_URL.rstrip("/") + "/api/v1/public/servers?limit=50"
+        with urllib.request.urlopen(url, timeout=8) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        api_error = exc
+
+    request = urllib.request.Request(
+        VPN_GATE_CSV,
+        headers={"User-Agent": "Findupto-Free-VPN/0.4"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        text = response.read().decode("utf-8", errors="replace")
+
+    servers = []
+    for row in csv.DictReader(line for line in text.splitlines() if not line.startswith("#")):
+        ip = row.get("IP", "").strip()
+        country = row.get("CountryLong", row.get("CountryShort", "")).strip()
+        if not ip or not country:
+            continue
+        try:
+            ping = float(row.get("Ping", ""))
+        except (TypeError, ValueError):
+            ping = None
+        try:
+            speed = float(row.get("Speed", "")) / 1_000_000
+        except (TypeError, ValueError):
+            speed = None
+        if ping is not None and ping > 300:
+            continue
+        if speed is not None and speed < 2:
+            continue
+        servers.append({
+            "id": f"vpngate-{ip}",
+            "country": country,
+            "city": row.get("City", "Unknown") or "Unknown",
+            "hostname": row.get("HostName", ""),
+            "ip": ip,
+            "protocol": "openvpn",
+            "ping_ms": ping,
+            "speed_mbps": speed,
+            "source": "VPN Gate",
+            "config_url": f"https://www.vpngate.net/common/openvpn_download.aspx?ip={ip}",
+        })
+
+    servers.sort(key=lambda s: (
+        -(s.get("speed_mbps") or 0),
+        s.get("ping_ms") if s.get("ping_ms") is not None else 9999,
+    ))
+    return servers[:50]
 
 
 def download_config(url):
-    with urllib.request.urlopen(url, timeout=15) as response:
+    request = urllib.request.Request(url, headers={"User-Agent": "Findupto-Free-VPN/0.4"})
+    with urllib.request.urlopen(request, timeout=20) as response:
         return response.read()
 
 
@@ -120,7 +178,7 @@ class App(tk.Tk):
             servers = fetch_servers()
             self.after(0, lambda: self._show_servers(servers))
         except Exception as exc:
-            self.after(0, lambda: self.status.set(f"Unable to reach Findupto API: {exc}"))
+            self.after(0, lambda: self.status.set(f"Unable to load free servers: {exc}"))
 
     def _show_servers(self, servers):
         self.servers = servers
