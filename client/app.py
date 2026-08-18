@@ -31,7 +31,6 @@ def relaunch_as_admin():
     try:
         executable = sys.executable
         if getattr(sys, "frozen", False):
-            executable = sys.executable
             params = " ".join(f'"{arg}"' for arg in sys.argv[1:])
         else:
             params = " ".join(f'"{arg}"' for arg in sys.argv)
@@ -63,26 +62,40 @@ def openvpn_path():
     return None
 
 
+def parse_vpngate_csv(text):
+    """VPN Gate prepends '*vpn_servers' before the real CSV header.
+    Start parsing at the '#HostName,...' header instead of treating the
+    marker as the CSV header."""
+    lines = text.splitlines()
+    header_index = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
+    if header_index is None:
+        raise RuntimeError("VPN Gate returned an unexpected server-list format.")
+
+    header = lines[header_index][1:]
+    data_lines = [header] + [line for line in lines[header_index + 1:] if line.strip() and not line.startswith("#")]
+    return csv.DictReader(data_lines)
+
+
 def fetch_servers():
-    """Use our API when deployed; fall back directly to VPN Gate so the desktop app
-    still works when the optional Findupto API is offline/not deployed yet."""
-    api_error = None
+    """Use our API when deployed; otherwise fetch the live VPN Gate list directly."""
     try:
         url = API_URL.rstrip("/") + "/api/v1/public/servers?limit=50"
         with urllib.request.urlopen(url, timeout=8) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        api_error = exc
+            servers = json.loads(response.read().decode("utf-8"))
+            if servers:
+                return servers
+    except Exception:
+        pass
 
     request = urllib.request.Request(
         VPN_GATE_CSV,
-        headers={"User-Agent": "Findupto-Free-VPN/0.4"},
+        headers={"User-Agent": "Findupto-Free-VPN/0.5"},
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=20) as response:
         text = response.read().decode("utf-8", errors="replace")
 
     servers = []
-    for row in csv.DictReader(line for line in text.splitlines() if not line.startswith("#")):
+    for row in parse_vpngate_csv(text):
         ip = row.get("IP", "").strip()
         country = row.get("CountryLong", row.get("CountryShort", "")).strip()
         if not ip or not country:
@@ -120,7 +133,7 @@ def fetch_servers():
 
 
 def download_config(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "Findupto-Free-VPN/0.4"})
+    request = urllib.request.Request(url, headers={"User-Agent": "Findupto-Free-VPN/0.5"})
     with urllib.request.urlopen(request, timeout=20) as response:
         return response.read()
 
@@ -129,8 +142,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("900x560")
-        self.minsize(760, 480)
+        self.geometry("1040x600")
+        self.minsize(850, 500)
         self.configure(padx=18, pady=18)
         self.servers = []
         self.connected = False
@@ -141,16 +154,16 @@ class App(tk.Tk):
 
     def build_ui(self):
         ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(self, text="Free public servers • Windows desktop • OpenVPN / WireGuard").pack(anchor="w", pady=(2, 14))
+        ttk.Label(self, text="Live free public VPN servers • VPN Gate • OpenVPN").pack(anchor="w", pady=(2, 14))
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True)
 
-        columns = ("country", "city", "protocol", "ping", "speed", "source")
+        columns = ("country", "city", "ip", "protocol", "ping", "speed", "source")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=15)
         for col, title, width in [
-            ("country", "Country", 180), ("city", "City", 160), ("protocol", "Protocol", 100),
-            ("ping", "Ping", 80), ("speed", "Speed", 90), ("source", "Source", 150)
+            ("country", "Country", 170), ("city", "City", 140), ("ip", "IP Address", 125),
+            ("protocol", "Protocol", 90), ("ping", "Ping", 75), ("speed", "Speed", 90), ("source", "Source", 120)
         ]:
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, anchor="w")
@@ -170,12 +183,14 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.status).pack(anchor="w")
 
     def refresh(self):
-        self.status.set("Finding free public servers…")
+        self.status.set("Downloading live free server list…")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
         try:
             servers = fetch_servers()
+            if not servers:
+                raise RuntimeError("VPN Gate returned no usable servers.")
             self.after(0, lambda: self._show_servers(servers))
         except Exception as exc:
             self.after(0, lambda: self.status.set(f"Unable to load free servers: {exc}"))
@@ -188,7 +203,7 @@ class App(tk.Tk):
             ping = f"{server['ping_ms']:.0f} ms" if server.get("ping_ms") is not None else "-"
             speed = f"{server['speed_mbps']:.1f} Mbps" if server.get("speed_mbps") is not None else "-"
             self.tree.insert("", "end", iid=str(index), values=(
-                server.get("country", ""), server.get("city", "Unknown"),
+                server.get("country", ""), server.get("city", "Unknown"), server.get("ip", ""),
                 server.get("protocol", "").upper(), ping, speed, server.get("source", "")))
         self.status.set(f"{len(self.servers)} free public server(s) available")
 
@@ -247,7 +262,7 @@ class App(tk.Tk):
             self.process = subprocess.Popen([ovpn, "--config", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.config_path = path
             self.connected = True
-            self.after(0, lambda: self.status.set(f"Connecting to {server.get('city', server.get('country', 'server'))}…"))
+            self.after(0, lambda: self.status.set(f"Connecting to {server.get('city', server.get('country', 'server'))} ({server.get('ip', '')})…"))
         except Exception as exc:
             self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
             self.after(0, lambda: self.status.set("Connection failed"))
