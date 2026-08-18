@@ -1,5 +1,5 @@
 #define MyAppName "Findupto Free VPN"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "Findupto"
 #define MyAppExeName "FinduptoVPN.exe"
 
@@ -23,6 +23,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 [Files]
 Source: "..\dist\FinduptoVPN.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "wireguard-amd64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "openvpn-amd64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
 Name: "{autodesktop}\Findupto Free VPN"; Filename: "{app}\{#MyAppExeName}"
@@ -30,4 +31,5 @@ Name: "{group}\Findupto Free VPN"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\wireguard-amd64.msi"" /qn /norestart"; StatusMsg: "Installing WireGuard networking driver..."; Flags: waituntilterminated
+Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\openvpn-amd64.msi"" /qn /norestart"; StatusMsg: "Installing OpenVPN networking driver..."; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Findupto Free VPN"; Flags: nowait postinstall skipifsilent
