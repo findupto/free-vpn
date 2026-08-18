@@ -1,5 +1,5 @@
 #define MyAppName "Findupto Free VPN"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "Findupto"
 #define MyAppExeName "FinduptoVPN.exe"
 
@@ -31,5 +31,13 @@ Name: "{group}\Findupto Free VPN"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\wireguard-amd64.msi"" /qn /norestart"; StatusMsg: "Installing WireGuard networking driver..."; Flags: waituntilterminated
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\openvpn-amd64.msi"" /qn /norestart"; StatusMsg: "Installing OpenVPN networking driver..."; Flags: waituntilterminated
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch Findupto Free VPN"; Flags: nowait postinstall skipifsilent
+Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\openvpn-amd64.msi"" /qn /norestart"; StatusMsg: "Installing OpenVPN Community..."; Flags: waituntilterminated
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""$ovpn=@('{autopf}\OpenVPN\bin\openvpn.exe','{autopf32}\OpenVPN\bin\openvpn.exe'); if(-not ($ovpn | Where-Object { Test-Path $_ })){ [System.Windows.Forms.MessageBox]::Show('OpenVPN Community installation could not be verified. Please run the installer again as Administrator.','Findupto Free VPN','OK','Error'); exit 1 }"""; StatusMsg: "Verifying OpenVPN Community installation..."; Flags: waituntilterminated
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch Findupto Free VPN"; Flags: nowait postinstall skipifsilent; Check: RuntimeReady
+
+[Code]
+function RuntimeReady(): Boolean;
+begin
+  Result := FileExists(ExpandConstant('{autopf}\OpenVPN\bin\openvpn.exe')) or
+            FileExists(ExpandConstant('{autopf32}\OpenVPN\bin\openvpn.exe'));
+end;
