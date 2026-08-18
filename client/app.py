@@ -47,11 +47,17 @@ def _find_executable(name, folders):
 
 
 def wireguard_path():
-    return _find_executable("wireguard.exe", [os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard"), os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "WireGuard")])
+    return _find_executable("wireguard.exe", [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "WireGuard"),
+    ])
 
 
 def openvpn_path():
-    return _find_executable("openvpn.exe", [os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "OpenVPN", "bin"), os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "OpenVPN", "bin")])
+    return _find_executable("openvpn.exe", [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "OpenVPN", "bin"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "OpenVPN", "bin"),
+    ])
 
 
 def _download(url, timeout=8):
@@ -74,21 +80,38 @@ def parse_vpngate_csv(text):
         country = (row.get("CountryLong") or row.get("CountryShort") or "").strip()
         if not ip or not country:
             continue
-        try: ping = float(row.get("Ping") or "")
-        except (TypeError, ValueError): ping = None
-        try: speed = float(row.get("Speed") or "") / 1_000_000
-        except (TypeError, ValueError): speed = None
-        try: score = int(float(row.get("Score") or 0))
-        except (TypeError, ValueError): score = 0
+        try:
+            ping = float(row.get("Ping") or "")
+        except (TypeError, ValueError):
+            ping = None
+        try:
+            speed = float(row.get("Speed") or "") / 1_000_000
+        except (TypeError, ValueError):
+            speed = None
+        try:
+            score = int(float(row.get("Score") or 0))
+        except (TypeError, ValueError):
+            score = 0
         if ping is not None and ping > 500:
             continue
         servers.append({
-            "id": f"vpngate-{ip}", "country": country, "city": (row.get("City") or "Unknown").strip() or "Unknown",
-            "hostname": (row.get("HostName") or "").strip(), "ip": ip, "protocol": "openvpn",
-            "ping_ms": ping, "speed_mbps": speed, "score": score, "source": "VPN Gate",
+            "id": f"vpngate-{ip}",
+            "country": country,
+            "city": (row.get("City") or "Unknown").strip() or "Unknown",
+            "hostname": (row.get("HostName") or "").strip(),
+            "ip": ip,
+            "protocol": "openvpn",
+            "ping_ms": ping,
+            "speed_mbps": speed,
+            "score": score,
+            "source": "VPN Gate",
             "config_url": f"https://www.vpngate.net/common/openvpn_download.aspx?ip={ip}",
         })
-    servers.sort(key=lambda s: (s.get("ping_ms") if s.get("ping_ms") is not None else 9999, -(s.get("speed_mbps") or 0), -(s.get("score") or 0)))
+    servers.sort(key=lambda s: (
+        s.get("ping_ms") if s.get("ping_ms") is not None else 9999,
+        -(s.get("speed_mbps") or 0),
+        -(s.get("score") or 0),
+    ))
     return servers[:100]
 
 
@@ -113,8 +136,6 @@ def load_cache(max_age=1800):
 
 
 def fetch_servers():
-    # Fast path: the API is cached server-side. A 4-second cap prevents a slow API
-    # deployment from blocking the client.
     try:
         raw = _download(API_URL.rstrip("/") + "/api/v1/public/servers?limit=100", timeout=4)
         result = json.loads(raw.decode("utf-8"))
@@ -162,19 +183,25 @@ class App(tk.Tk):
     def build_ui(self):
         ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
         ttk.Label(self, text="Fast server discovery • OpenVPN + WireGuard • Automatic fallback").pack(anchor="w", pady=(2, 14))
-        frame = ttk.Frame(self); frame.pack(fill="both", expand=True)
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True)
         columns = ("country", "city", "ip", "protocol", "ping", "speed", "source")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=17)
-        for col, title, width in [("country","Country",150),("city","City",140),("ip","IP Address",125),("protocol","Protocol",90),("ping","Ping",75),("speed","Speed",95),("source","Source",120)]:
-            self.tree.heading(col, text=title); self.tree.column(col, width=width, anchor="w")
+        for col, title, width in [("country", "Country", 150), ("city", "City", 140), ("ip", "IP Address", 125), ("protocol", "Protocol", 90), ("ping", "Ping", 75), ("speed", "Speed", 95), ("source", "Source", 120)]:
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview); scroll.pack(side="right", fill="y"); self.tree.configure(yscrollcommand=scroll.set)
-        buttons = ttk.Frame(self); buttons.pack(fill="x", pady=(14, 8))
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.tree.configure(yscrollcommand=scroll.set)
+        buttons = ttk.Frame(self)
+        buttons.pack(fill="x", pady=(14, 8))
         ttk.Button(buttons, text="Refresh Servers", command=self.refresh).pack(side="left")
         ttk.Button(buttons, text="Best Server", command=self.connect_best).pack(side="left", padx=8)
-        self.connect_btn = ttk.Button(buttons, text="Connect", command=self.connect); self.connect_btn.pack(side="left")
+        ttk.Button(buttons, text="Connect", command=self.connect).pack(side="left")
         ttk.Button(buttons, text="Disconnect", command=self.disconnect).pack(side="left", padx=8)
-        self.status = tk.StringVar(value="Finding free servers…"); ttk.Label(self, textvariable=self.status).pack(anchor="w")
+        self.status = tk.StringVar(value="Finding free servers…")
+        ttk.Label(self, textvariable=self.status).pack(anchor="w")
 
     def refresh(self):
         self.status.set("Loading servers…")
@@ -182,44 +209,59 @@ class App(tk.Tk):
 
     def _refresh_worker(self):
         try:
-            servers = fetch_servers(); self.after(0, lambda: self._show_servers(servers))
+            servers = fetch_servers()
+            self.after(0, lambda: self._show_servers(servers))
         except Exception as exc:
             self.after(0, lambda: self.status.set(f"Unable to load servers: {exc}"))
 
     def _show_servers(self, servers):
         self.servers = servers
-        for item in self.tree.get_children(): self.tree.delete(item)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
         for index, server in enumerate(servers):
             ping = f"{server['ping_ms']:.0f} ms" if server.get("ping_ms") is not None else "-"
             speed = f"{server['speed_mbps']:.1f} Mbps" if server.get("speed_mbps") is not None else "-"
-            self.tree.insert("", "end", iid=str(index), values=(server.get("country",""), server.get("city","Unknown"), server.get("ip",""), server.get("protocol","").upper(), ping, speed, server.get("source","")))
-        if servers: self.tree.selection_set("0")
+            self.tree.insert("", "end", iid=str(index), values=(server.get("country", ""), server.get("city", "Unknown"), server.get("ip", ""), server.get("protocol", "").upper(), ping, speed, server.get("source", "")))
+        if servers:
+            self.tree.selection_set("0")
         self.status.set(f"{len(servers)} server(s) ready")
 
     def selected_server(self, silent=False):
         selection = self.tree.selection()
         if not selection:
-            if not silent: messagebox.showinfo(APP_NAME, "Select a server first.")
+            if not silent:
+                messagebox.showinfo(APP_NAME, "Select a server first.")
             return None
         return self.servers[int(selection[0])]
 
     def connect_best(self):
         if not self.servers:
-            return messagebox.showinfo(APP_NAME, "No servers are available yet.")
-        self.tree.selection_set("0"); self.tree.see("0"); self.connect()
+            messagebox.showinfo(APP_NAME, "No servers are available yet.")
+            return
+        self.tree.selection_set("0")
+        self.tree.see("0")
+        self.connect()
 
     def connect(self):
-        if not sys.platform.startswith("win"): return messagebox.showerror(APP_NAME, "Windows is required for VPN connections.")
+        if not sys.platform.startswith("win"):
+            messagebox.showerror(APP_NAME, "Windows is required for VPN connections.")
+            return
         server = self.selected_server()
-        if not server: return
+        if not server:
+            return
         if not is_admin():
-            if relaunch_as_admin(): self.destroy()
-            else: messagebox.showerror(APP_NAME, "Administrator permission is required to create the VPN tunnel.")
+            if relaunch_as_admin():
+                self.destroy()
+            else:
+                messagebox.showerror(APP_NAME, "Administrator permission is required to create the VPN tunnel.")
             return
         protocol = server.get("protocol", "").lower()
-        if protocol == "openvpn": self.connect_openvpn(server)
-        elif protocol == "wireguard": self.connect_wireguard(server)
-        else: messagebox.showerror(APP_NAME, f"Unsupported VPN protocol: {protocol or 'unknown'}")
+        if protocol == "openvpn":
+            self.connect_openvpn(server)
+        elif protocol == "wireguard":
+            self.connect_wireguard(server)
+        else:
+            messagebox.showerror(APP_NAME, f"Unsupported VPN protocol: {protocol or 'unknown'}")
 
     def connect_openvpn(self, server):
         ovpn = openvpn_path()
@@ -236,71 +278,99 @@ class App(tk.Tk):
             if data.startswith(b"PK"):
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
                     configs = [n for n in archive.namelist() if n.lower().endswith(".ovpn")]
-                    if not configs: raise RuntimeError("No OpenVPN configuration was provided.")
+                    if not configs:
+                        raise RuntimeError("No OpenVPN configuration was provided.")
                     config = archive.read(configs[0])
-            else: config = data
-            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".ovpn"); os.close(fd)
-            with open(path, "wb") as handle: handle.write(config)
+            else:
+                config = data
+            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".ovpn")
+            os.close(fd)
+            with open(path, "wb") as handle:
+                handle.write(config)
             self._stop_process()
             log_path = path + ".log"
-            log = open(log_path, "w", encoding="utf-8", errors="replace")
-            self.process = subprocess.Popen([ovpn, "--config", path, "--log", log_path, "--auth-nocache"], stdout=log, stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.config_path = path; self.connected = True
+            self.process = subprocess.Popen([ovpn, "--config", path, "--log", log_path, "--auth-nocache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.config_path = path
+            self.connected = True
             self.after(0, lambda: self.status.set(f"Connecting to {server.get('city', server.get('country', 'server'))}…"))
-            threading.Thread(target=self._watch_openvpn, args=(server, log), daemon=True).start()
+            threading.Thread(target=self._watch_openvpn, args=(server,), daemon=True).start()
         except Exception as exc:
             if path:
-                try: os.remove(path)
-                except OSError: pass
-            self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc))); self.after(0, lambda: self.status.set("Connection failed"))
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
+            self.after(0, lambda: self.status.set("Connection failed"))
 
-    def _watch_openvpn(self, server, log):
-        if not self.process: return
-        code = self.process.wait(); log.close()
+    def _watch_openvpn(self, server):
+        process = self.process
+        if not process:
+            return
+        code = process.wait()
         if self.connected:
-            self.after(0, lambda: self.status.set(f"VPN stopped (exit code {code})"))
             self.connected = False
+            self.after(0, lambda: self.status.set(f"VPN stopped (exit code {code})"))
 
     def connect_wireguard(self, server):
         wg = wireguard_path()
-        if not wg: return messagebox.showerror(APP_NAME, "WireGuard for Windows is missing. Re-run the Findupto installer.")
-        if not server.get("config_url"): return messagebox.showwarning(APP_NAME, "This WireGuard server has no client configuration.")
-        self.status.set("Preparing WireGuard…"); threading.Thread(target=self._wireguard_worker, args=(wg, server), daemon=True).start()
+        if not wg:
+            messagebox.showerror(APP_NAME, "WireGuard for Windows is missing. Re-run the Findupto installer.")
+            return
+        if not server.get("config_url"):
+            messagebox.showwarning(APP_NAME, "This WireGuard server has no client configuration.")
+            return
+        self.status.set("Preparing WireGuard…")
+        threading.Thread(target=self._wireguard_worker, args=(wg, server), daemon=True).start()
 
     def _wireguard_worker(self, wg, server):
         path = None
         try:
             config = download_config(server["config_url"]).decode("utf-8")
-            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".conf"); os.close(fd)
-            with open(path, "w", encoding="utf-8") as handle: handle.write(config)
+            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".conf")
+            os.close(fd)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(config)
             subprocess.run([wg, "/uninstalltunnelservice", TUNNEL_NAME], capture_output=True, timeout=15)
             result = subprocess.run([wg, "/installtunnelservice", path], capture_output=True, text=True, timeout=30)
-            if result.returncode != 0: raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "WireGuard failed to start")
-            self.config_path = path; self.connected = True
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "WireGuard failed to start")
+            self.config_path = path
+            self.connected = True
             self.after(0, lambda: self.status.set(f"Connected to {server.get('city', server.get('country', 'server'))}"))
         except Exception as exc:
             if path:
-                try: os.remove(path)
-                except OSError: pass
-            self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc))); self.after(0, lambda: self.status.set("Connection failed"))
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
+            self.after(0, lambda: self.status.set("Connection failed"))
 
     def _stop_process(self):
         if self.process and self.process.poll() is None:
             self.process.terminate()
-            try: self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired: self.process.kill()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
         self.process = None
 
     def disconnect(self):
         if not is_admin():
-            if relaunch_as_admin(): self.destroy()
+            if relaunch_as_admin():
+                self.destroy()
             return
         wg = wireguard_path()
-        if wg: subprocess.run([wg, "/uninstalltunnelservice", TUNNEL_NAME], capture_output=True)
-        self._stop_process(); self.connected = False
+        if wg:
+            subprocess.run([wg, "/uninstalltunnelservice", TUNNEL_NAME], capture_output=True)
+        self._stop_process()
+        self.connected = False
         if self.config_path:
-            try: os.remove(self.config_path)
-            except OSError: pass
+            try:
+                os.remove(self.config_path)
+            except OSError:
+                pass
             self.config_path = None
         self.status.set("Disconnected")
 
