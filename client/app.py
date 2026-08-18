@@ -6,6 +6,8 @@ import sys
 import tempfile
 import threading
 import urllib.request
+import zipfile
+import io
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -21,6 +23,17 @@ def is_admin():
         return False
 
 
+def relaunch_as_admin():
+    if is_admin():
+        return True
+    try:
+        params = " ".join(f'"{arg}"' for arg in sys.argv)
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        return result > 32
+    except Exception:
+        return False
+
+
 def wireguard_path():
     candidates = [
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WireGuard", "wireguard.exe"),
@@ -32,40 +45,55 @@ def wireguard_path():
     return None
 
 
-def fetch_nodes():
-    url = API_URL.rstrip("/") + "/api/v1/nodes"
-    with urllib.request.urlopen(url, timeout=8) as response:
+def openvpn_path():
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "OpenVPN", "bin", "openvpn.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "OpenVPN", "bin", "openvpn.exe"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def fetch_servers():
+    url = API_URL.rstrip("/") + "/api/v1/public/servers?limit=50"
+    with urllib.request.urlopen(url, timeout=15) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def download_config(url):
-    with urllib.request.urlopen(url, timeout=10) as response:
-        return response.read().decode("utf-8")
+    with urllib.request.urlopen(url, timeout=15) as response:
+        return response.read()
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("760x500")
-        self.minsize(680, 440)
+        self.geometry("900x560")
+        self.minsize(760, 480)
         self.configure(padx=18, pady=18)
-        self.nodes = []
+        self.servers = []
         self.connected = False
         self.config_path = None
+        self.process = None
         self.build_ui()
         self.refresh()
 
     def build_ui(self):
         ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(self, text="Fast Windows desktop client • WireGuard-first").pack(anchor="w", pady=(2, 14))
+        ttk.Label(self, text="Free public servers • Windows desktop • OpenVPN / WireGuard").pack(anchor="w", pady=(2, 14))
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True)
 
-        columns = ("country", "city", "protocol", "status")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=12)
-        for col, title, width in [("country", "Country", 180), ("city", "City", 180), ("protocol", "Protocol", 120), ("status", "Status", 180)]:
+        columns = ("country", "city", "protocol", "ping", "speed", "source")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=15)
+        for col, title, width in [
+            ("country", "Country", 180), ("city", "City", 160), ("protocol", "Protocol", 100),
+            ("ping", "Ping", 80), ("speed", "Speed", 90), ("source", "Source", 150)
+        ]:
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
@@ -75,64 +103,111 @@ class App(tk.Tk):
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", pady=(14, 8))
-        ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(buttons, text="Refresh Servers", command=self.refresh).pack(side="left")
         self.connect_btn = ttk.Button(buttons, text="Connect", command=self.connect)
         self.connect_btn.pack(side="left", padx=8)
         ttk.Button(buttons, text="Disconnect", command=self.disconnect).pack(side="left")
 
-        self.status = tk.StringVar(value="Ready")
+        self.status = tk.StringVar(value="Finding free servers…")
         ttk.Label(self, textvariable=self.status).pack(anchor="w")
 
     def refresh(self):
-        self.status.set("Finding healthy WireGuard servers…")
+        self.status.set("Finding free public servers…")
         threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
         try:
-            nodes = fetch_nodes()
-            self.after(0, lambda: self._show_nodes(nodes))
+            servers = fetch_servers()
+            self.after(0, lambda: self._show_servers(servers))
         except Exception as exc:
             self.after(0, lambda: self.status.set(f"Unable to reach Findupto API: {exc}"))
 
-    def _show_nodes(self, nodes):
-        self.nodes = [n for n in nodes if n.get("protocol", "wireguard").lower() == "wireguard"]
+    def _show_servers(self, servers):
+        self.servers = servers
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for index, node in enumerate(self.nodes):
-            ready = "Ready" if node.get("config_url") else "No client config"
-            self.tree.insert("", "end", iid=str(index), values=(node.get("country", ""), node.get("city", ""), "WireGuard", ready))
-        self.status.set(f"{len(self.nodes)} healthy WireGuard server(s) available")
+        for index, server in enumerate(self.servers):
+            ping = f"{server['ping_ms']:.0f} ms" if server.get("ping_ms") is not None else "-"
+            speed = f"{server['speed_mbps']:.1f} Mbps" if server.get("speed_mbps") is not None else "-"
+            self.tree.insert("", "end", iid=str(index), values=(
+                server.get("country", ""), server.get("city", "Unknown"),
+                server.get("protocol", "").upper(), ping, speed, server.get("source", "")))
+        self.status.set(f"{len(self.servers)} free public server(s) available")
 
-    def selected_node(self):
+    def selected_server(self):
         selection = self.tree.selection()
         if not selection:
             messagebox.showinfo(APP_NAME, "Select a server first.")
             return None
-        return self.nodes[int(selection[0])]
+        return self.servers[int(selection[0])]
 
     def connect(self):
         if not sys.platform.startswith("win"):
             messagebox.showerror(APP_NAME, "The desktop client currently supports Windows only.")
             return
         if not is_admin():
-            messagebox.showerror(APP_NAME, "Administrator permission is required to create the VPN tunnel.")
+            if relaunch_as_admin():
+                self.destroy()
+            else:
+                messagebox.showerror(APP_NAME, "Administrator permission is required to create the VPN tunnel.")
             return
+        server = self.selected_server()
+        if not server:
+            return
+        protocol = server.get("protocol", "").lower()
+        if protocol == "openvpn":
+            self.connect_openvpn(server)
+        elif protocol == "wireguard":
+            self.connect_wireguard(server)
+        else:
+            messagebox.showerror(APP_NAME, f"Unsupported protocol: {protocol}")
+
+    def connect_openvpn(self, server):
+        ovpn = openvpn_path()
+        if not ovpn:
+            messagebox.showerror(APP_NAME, "OpenVPN is not installed. Install OpenVPN for Windows, then try again.")
+            return
+        self.status.set("Downloading VPN configuration…")
+        threading.Thread(target=self._openvpn_worker, args=(ovpn, server), daemon=True).start()
+
+    def _openvpn_worker(self, ovpn, server):
+        try:
+            data = download_config(server["config_url"])
+            if data.startswith(b"PK"):
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    configs = [n for n in archive.namelist() if n.lower().endswith(".ovpn")]
+                    if not configs:
+                        raise RuntimeError("No OpenVPN configuration was provided by the server.")
+                    config = archive.read(configs[0])
+            else:
+                config = data
+            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".ovpn")
+            os.close(fd)
+            with open(path, "wb") as handle:
+                handle.write(config)
+            self._stop_process()
+            self.process = subprocess.Popen([ovpn, "--config", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.config_path = path
+            self.connected = True
+            self.after(0, lambda: self.status.set(f"Connecting to {server.get('city', server.get('country', 'server'))}…"))
+        except Exception as exc:
+            self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
+            self.after(0, lambda: self.status.set("Connection failed"))
+
+    def connect_wireguard(self, server):
         wg = wireguard_path()
         if not wg:
-            messagebox.showerror(APP_NAME, "WireGuard for Windows is not installed. Re-run the Findupto installer.")
+            messagebox.showerror(APP_NAME, "WireGuard for Windows is not installed.")
             return
-        node = self.selected_node()
-        if not node:
+        if not server.get("config_url"):
+            messagebox.showwarning(APP_NAME, "This WireGuard server has no client configuration yet.")
             return
-        if not node.get("config_url"):
-            messagebox.showwarning(APP_NAME, "This server is registered, but it has no client configuration yet.")
-            return
-        self.status.set("Downloading short-lived VPN configuration…")
-        threading.Thread(target=self._connect_worker, args=(wg, node), daemon=True).start()
+        self.status.set("Downloading WireGuard configuration…")
+        threading.Thread(target=self._wireguard_worker, args=(wg, server), daemon=True).start()
 
-    def _connect_worker(self, wg, node):
+    def _wireguard_worker(self, wg, server):
         try:
-            config = download_config(node["config_url"])
+            config = download_config(server["config_url"]).decode("utf-8")
             fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".conf")
             os.close(fd)
             with open(path, "w", encoding="utf-8") as handle:
@@ -143,17 +218,29 @@ class App(tk.Tk):
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "WireGuard failed to start")
             self.config_path = path
             self.connected = True
-            self.after(0, lambda: self.status.set(f"Connected to {node.get('city', node.get('country', 'server'))}"))
+            self.after(0, lambda: self.status.set(f"Connected to {server.get('city', server.get('country', 'server'))}"))
         except Exception as exc:
             self.after(0, lambda: messagebox.showerror(APP_NAME, str(exc)))
             self.after(0, lambda: self.status.set("Connection failed"))
 
+    def _stop_process(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+
     def disconnect(self):
-        wg = wireguard_path()
-        if not wg or not is_admin():
-            self.status.set("Administrator permission is required to disconnect.")
+        if not is_admin():
+            if relaunch_as_admin():
+                self.destroy()
             return
-        subprocess.run([wg, "/uninstalltunnelservice", TUNNEL_NAME], capture_output=True)
+        wg = wireguard_path()
+        if wg:
+            subprocess.run([wg, "/uninstalltunnelservice", TUNNEL_NAME], capture_output=True)
+        self._stop_process()
         if self.config_path:
             try:
                 os.remove(self.config_path)
