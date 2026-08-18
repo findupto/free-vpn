@@ -1,17 +1,18 @@
 import csv
-import io
 import os
 import secrets
 import time
+import asyncio
 from typing import Dict, List
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Findupto Free VPN Directory", version="0.2.0")
+app = FastAPI(title="Findupto Free VPN Directory", version="0.3.0")
 API_KEY = os.getenv("FINDUPTO_API_KEY", "change-me")
 VPN_GATE_CSV = "https://www.vpngate.net/api/iphone/"
+CACHE_TTL = max(10, int(os.getenv("VPN_CACHE_TTL", "60")))
 
 class Node(BaseModel):
     id: str = Field(min_length=3, max_length=80)
@@ -22,6 +23,8 @@ class Node(BaseModel):
     protocol: str = "wireguard"
     active: bool = True
     last_seen: float = 0
+    # Short-lived URL returning a client WireGuard config. Never put a private key in the registry itself.
+    config_url: str | None = None
 
 class PublicServer(BaseModel):
     id: str
@@ -37,6 +40,8 @@ class PublicServer(BaseModel):
     config_url: str | None = None
 
 nodes: Dict[str, Node] = {}
+_cache: tuple[float, list[PublicServer]] = (0, [])
+_cache_lock = asyncio.Lock()
 
 
 def require_api_key(x_api_key: str = Header(default="")):
@@ -53,7 +58,7 @@ def as_float(value: str):
 
 def fetch_vpngate_servers(limit: int = 100) -> list[PublicServer]:
     try:
-        response = httpx.get(VPN_GATE_CSV, timeout=12, follow_redirects=True)
+        response = httpx.get(VPN_GATE_CSV, timeout=8, follow_redirects=True)
         response.raise_for_status()
         text = response.content.decode("utf-8", errors="replace")
     except httpx.HTTPError:
@@ -70,7 +75,6 @@ def fetch_vpngate_servers(limit: int = 100) -> list[PublicServer]:
             continue
         if speed is not None and speed < 5:
             continue
-        # Prefer low latency, high throughput and long uptime.
         score = (speed or 0) * 2 - (ping or 250) * 0.8 + min(as_float(row.get("Uptime", "0")) or 0, 100) * 0.05
         rows.append(PublicServer(
             id=f"vpngate-{row.get('IP')}-{row.get('HostName')}",
@@ -89,9 +93,24 @@ def fetch_vpngate_servers(limit: int = 100) -> list[PublicServer]:
     return rows[:limit]
 
 
+async def get_vpngate_servers(limit: int = 100) -> list[PublicServer]:
+    global _cache
+    now = time.monotonic()
+    if now - _cache[0] < CACHE_TTL and _cache[1]:
+        return _cache[1][:limit]
+    async with _cache_lock:
+        now = time.monotonic()
+        if now - _cache[0] < CACHE_TTL and _cache[1]:
+            return _cache[1][:limit]
+        servers = await asyncio.to_thread(fetch_vpngate_servers, 100)
+        if servers:
+            _cache = (time.monotonic(), servers)
+        return _cache[1][:limit]
+
+
 @app.get("/")
 def root():
-    return {"name": "Findupto Free VPN", "status": "ok"}
+    return {"name": "Findupto Free VPN", "status": "ok", "version": app.version}
 
 
 @app.get("/health")
@@ -105,23 +124,24 @@ def list_nodes(country: str | None = None):
     healthy = [n for n in nodes.values() if n.active and now - n.last_seen < 300]
     if country:
         healthy = [n for n in healthy if n.country.lower() == country.lower()]
+    healthy.sort(key=lambda n: (n.country.lower(), n.city.lower()))
     return healthy
 
 
 @app.get("/api/v1/public/servers", response_model=List[PublicServer])
-def public_servers(
+async def public_servers(
     country: str | None = None,
     limit: int = Query(default=30, ge=1, le=100),
 ):
-    servers = fetch_vpngate_servers(100)
+    servers = await get_vpngate_servers(100)
     if country:
         servers = [s for s in servers if s.country.lower() == country.lower()]
     return servers[:limit]
 
 
 @app.get("/api/v1/public/best", response_model=PublicServer | None)
-def best_public_server(country: str | None = None):
-    servers = fetch_vpngate_servers(100)
+async def best_public_server(country: str | None = None):
+    servers = await get_vpngate_servers(100)
     if country:
         servers = [s for s in servers if s.country.lower() == country.lower()]
     return servers[0] if servers else None
