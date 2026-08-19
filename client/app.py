@@ -4,12 +4,12 @@ import io
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.request
 import zipfile
 import winreg
@@ -17,11 +17,18 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "Findupto Free VPN"
-APP_VERSION = "0.9.0"
+APP_VERSION = "1.0.0"
 API_URL = os.environ.get("FINDUPTO_API_URL", "https://findupto-free-vpn.onrender.com")
-OPENVPN_INSTALLER_URLS = [
-    os.environ.get("FINDUPTO_OPENVPN_INSTALLER_URL", "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi"),
-    "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I001-amd64.msi",
+DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Findupto")
+CACHE_FILE = os.path.join(DATA_DIR, "servers.json")
+LOG_FILE = os.path.join(DATA_DIR, "findupto.log")
+TUNNEL_NAME = "FinduptoVPN"
+BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+OPENVPN_URLS = [
+    "https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi",
+    "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi",
+    "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi",
+    "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.22-I001-amd64.msi",
 ]
 VPN_GATE_URLS = [
     "https://www.vpngate.net/api/iphone/",
@@ -29,469 +36,279 @@ VPN_GATE_URLS = [
     "http://www.vpngate.net/api/iphone/",
     "http://vpngate.net/api/iphone/",
 ]
-TUNNEL_NAME = "FinduptoVPN"
-BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
-DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "Findupto")
-CACHE_FILE = os.path.join(DATA_DIR, "servers.json")
-LOG_FILE = os.path.join(DATA_DIR, "findupto.log")
 
-
-def log(message):
+def log(msg):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
     except OSError:
         pass
-
 
 def is_windows():
     return sys.platform.startswith("win")
 
-
 def is_admin():
-    if not is_windows():
-        return False
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    if not is_windows(): return False
+    try: return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception: return False
 
-
-def relaunch_as_admin():
-    if is_admin():
-        return True
+def elevate():
+    if is_admin(): return True
     try:
-        executable = sys.executable
+        exe = sys.executable
         args = sys.argv if not getattr(sys, "frozen", False) else sys.argv[1:]
         params = " ".join('"' + str(a).replace('"', '\\"') + '"' for a in args)
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, BASE_DIR, 1)
-        return rc > 32
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, BASE_DIR, 1) > 32
     except Exception as exc:
-        log(f"Elevation failed: {exc}")
-        return False
+        log(f"Elevation failed: {exc}"); return False
 
+def which(name):
+    try: return shutil.which(name)
+    except Exception: return None
 
-def _which(name):
-    try:
-        return shutil.which(name)
-    except Exception:
-        return None
-
-
-def _candidate_executables(name):
-    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    pf32 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    pd = os.environ.get("ProgramData", r"C:\ProgramData")
-    local = os.environ.get("LOCALAPPDATA", "")
-    candidates = []
-    if name.lower() == "openvpn.exe":
-        roots = [
-            os.path.join(pf, "OpenVPN"), os.path.join(pf32, "OpenVPN"),
-            os.path.join(pd, "OpenVPN"), os.path.join(local, "OpenVPN"),
-        ]
-        for root in roots:
-            candidates.extend([os.path.join(root, "bin", name), os.path.join(root, name)])
-    else:
-        roots = [os.path.join(pf, "WireGuard"), os.path.join(pf32, "WireGuard"), os.path.join(local, "WireGuard")]
-        for root in roots:
-            candidates.append(os.path.join(root, name))
-    return candidates
-
-
-def _registry_install_locations(product_words):
-    found = []
-    uninstall_roots = [
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-    ]
-    roots = [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]
-    for root in roots:
-        for uninstall_root in uninstall_roots:
+def registry_locations(words):
+    result=[]
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for parent_name in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
             try:
-                with winreg.OpenKey(root, uninstall_root) as parent:
-                    count = winreg.QueryInfoKey(parent)[0]
-                    for i in range(count):
+                with winreg.OpenKey(root,parent_name) as parent:
+                    for i in range(winreg.QueryInfoKey(parent)[0]):
                         try:
-                            sub = winreg.EnumKey(parent, i)
-                            with winreg.OpenKey(parent, sub) as key:
-                                name = str(winreg.QueryValueEx(key, "DisplayName")[0])
-                                if not any(w.lower() in name.lower() for w in product_words):
-                                    continue
-                                for value_name in ("InstallLocation", "InstallDir", "Path"):
+                            with winreg.OpenKey(parent,winreg.EnumKey(parent,i)) as key:
+                                name=str(winreg.QueryValueEx(key,"DisplayName")[0])
+                                if not any(w.lower() in name.lower() for w in words): continue
+                                for vn in ("InstallLocation","InstallDir","Path"):
                                     try:
-                                        value = winreg.QueryValueEx(key, value_name)[0]
-                                        if isinstance(value, str) and value:
-                                            found.append(value)
-                                    except OSError:
-                                        pass
-                        except OSError:
-                            continue
-            except OSError:
-                continue
-    return found
+                                        v=winreg.QueryValueEx(key,vn)[0]
+                                        if isinstance(v,str) and v: result.append(v)
+                                    except OSError: pass
+                        except OSError: pass
+            except OSError: pass
+    return result
 
-
-def openvpn_path():
-    seen = set()
-    candidates = _candidate_executables("openvpn.exe")
-    candidates += [os.path.join(p, "bin", "openvpn.exe") for p in _registry_install_locations(["OpenVPN"]) ]
-    candidates += [os.path.join(p, "openvpn.exe") for p in _registry_install_locations(["OpenVPN"]) ]
-    candidates.append(_which("openvpn.exe"))
-    for path in candidates:
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        if os.path.isfile(path):
-            return path
+def find_openvpn():
+    pf=os.environ.get("ProgramFiles",r"C:\Program Files"); pf32=os.environ.get("ProgramFiles(x86)",r"C:\Program Files (x86)"); pd=os.environ.get("ProgramData",r"C:\ProgramData"); local=os.environ.get("LOCALAPPDATA","")
+    roots=[os.path.join(pf,"OpenVPN"),os.path.join(pf32,"OpenVPN"),os.path.join(pd,"OpenVPN"),os.path.join(local,"OpenVPN")]
+    for r in registry_locations(("OpenVPN Community","OpenVPN")): roots.append(r)
+    candidates=[]
+    for r in roots: candidates += [os.path.join(r,"bin","openvpn.exe"),os.path.join(r,"openvpn.exe")]
+    candidates += [which("openvpn.exe"),which("openvpn")]
+    for p in candidates:
+        if p and os.path.isfile(p): return os.path.abspath(p)
     return None
 
-
-def wireguard_path():
-    candidates = _candidate_executables("wireguard.exe")
-    candidates.append(_which("wireguard.exe"))
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
+def find_wireguard():
+    pf=os.environ.get("ProgramFiles",r"C:\Program Files"); pf32=os.environ.get("ProgramFiles(x86)",r"C:\Program Files (x86)")
+    for p in (os.path.join(pf,"WireGuard","wireguard.exe"),os.path.join(pf32,"WireGuard","wireguard.exe"),which("wireguard.exe")):
+        if p and os.path.isfile(p): return os.path.abspath(p)
     return None
 
+def _urllib(url,dst):
+    req=urllib.request.Request(url,headers={"User-Agent":f"Findupto-Free-VPN/{APP_VERSION}","Accept":"*/*"})
+    with urllib.request.urlopen(req,timeout=25,context=ssl.create_default_context()) as r,open(dst,"wb") as f: shutil.copyfileobj(r,f)
+    return os.path.getsize(dst)
 
-def _powershell_download(url, destination):
-    scripts = [
-        "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing -Uri '%s' -OutFile '%s'" % (url.replace("'", "''"), destination.replace("'", "''")),
-        "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('%s','%s')" % (url.replace("'", "''"), destination.replace("'", "''")),
-    ]
-    last = None
-    for script in scripts:
+def _curl(url,dst):
+    exe=which("curl.exe") or which("curl")
+    if not exe: raise RuntimeError("curl unavailable")
+    r=subprocess.run([exe,"--fail","--location","--retry","4","--retry-all-errors","--connect-timeout","8","--max-time","90","-A",f"Findupto-Free-VPN/{APP_VERSION}","-o",dst,url],capture_output=True,text=True,timeout=110)
+    if r.returncode: raise RuntimeError((r.stderr or r.stdout or "curl failed").strip())
+    return os.path.getsize(dst)
+
+def _powershell(url,dst):
+    exe=which("powershell.exe") or which("pwsh.exe")
+    if not exe: raise RuntimeError("PowerShell unavailable")
+    u=url.replace("'","''"); d=dst.replace("'","''")
+    scripts=[f"$ProgressPreference='SilentlyContinue';[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing -Uri '{u}' -OutFile '{d}'",f"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;(New-Object Net.WebClient).DownloadFile('{u}','{d}')"]
+    last=""
+    for s in scripts:
         try:
-            r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, text=True, timeout=90)
-            if r.returncode == 0 and os.path.isfile(destination) and os.path.getsize(destination) > 0:
-                return True
-            last = (r.stderr or r.stdout or "").strip()
-        except Exception as exc:
-            last = str(exc)
-    raise RuntimeError(last or "PowerShell download failed")
+            r=subprocess.run([exe,"-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-Command",s],capture_output=True,text=True,timeout=100)
+            if r.returncode==0 and os.path.isfile(dst) and os.path.getsize(dst)>0: return os.path.getsize(dst)
+            last=(r.stderr or r.stdout or "").strip()
+        except Exception as e: last=str(e)
+    raise RuntimeError(last or "PowerShell failed")
 
+def _bits(url,dst):
+    exe=which("powershell.exe") or which("pwsh.exe")
+    if not exe: raise RuntimeError("PowerShell unavailable")
+    u=url.replace("'","''"); d=dst.replace("'","''")
+    s=f"Start-BitsTransfer -Source '{u}' -Destination '{d}' -ErrorAction Stop"
+    r=subprocess.run([exe,"-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-Command",s],capture_output=True,text=True,timeout=150)
+    if r.returncode or not os.path.isfile(dst): raise RuntimeError((r.stderr or r.stdout or "BITS failed").strip())
+    return os.path.getsize(dst)
 
-def _curl_download(url, destination):
-    curl = _which("curl.exe") or _which("curl")
-    if not curl:
-        raise RuntimeError("curl.exe is not available")
-    r = subprocess.run([curl, "--fail", "--location", "--retry", "3", "--retry-delay", "2", "--connect-timeout", "15", "--max-time", "120", "-A", "Findupto-Free-VPN/0.9", "-o", destination, url], capture_output=True, text=True, timeout=140)
-    if r.returncode != 0 or not os.path.isfile(destination) or os.path.getsize(destination) == 0:
-        raise RuntimeError((r.stderr or r.stdout or "curl failed").strip())
-    return True
-
-
-def download_file(url, destination, allow_http=True):
-    """Download using several Windows-native methods without disabling TLS verification."""
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    errors = []
-    request = urllib.request.Request(url, headers={"User-Agent": f"Findupto-Free-VPN/{APP_VERSION}", "Accept": "*/*"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response, open(destination, "wb") as out:
-            shutil.copyfileobj(response, out)
-        if os.path.getsize(destination) > 0:
-            return destination
-    except Exception as exc:
-        errors.append("urllib: " + str(exc))
-        log(errors[-1])
-    for method in (_curl_download, _powershell_download):
+def download_file(url,dst,allow_http=False):
+    os.makedirs(os.path.dirname(dst) or ".",exist_ok=True); errors=[]
+    for method in (_urllib,_curl,_powershell,_bits):
         try:
-            method(url, destination)
-            if os.path.getsize(destination) > 0:
-                return destination
-        except Exception as exc:
-            errors.append(method.__name__ + ": " + str(exc))
-            log(errors[-1])
+            if os.path.exists(dst): os.remove(dst)
+            if method(url,dst)>0: log(f"download ok {method.__name__}: {url}"); return dst
+        except Exception as e:
+            errors.append(f"{method.__name__}: {e}"); log(errors[-1])
     if allow_http and url.lower().startswith("https://"):
-        http_url = "http://" + url[8:]
-        try:
-            request = urllib.request.Request(http_url, headers={"User-Agent": f"Findupto-Free-VPN/{APP_VERSION}"})
-            with urllib.request.urlopen(request, timeout=30) as response, open(destination, "wb") as out:
-                shutil.copyfileobj(response, out)
-            if os.path.getsize(destination) > 0:
-                return destination
-        except Exception as exc:
-            errors.append("http fallback: " + str(exc))
-            log(errors[-1])
-    raise RuntimeError("Download failed using all methods: " + " | ".join(errors[-4:]))
+        h="http://"+url[8:]
+        for method in (_urllib,_curl,_powershell,_bits):
+            try:
+                if os.path.exists(dst): os.remove(dst)
+                if method(h,dst)>0: return dst
+            except Exception as e: errors.append(f"{method.__name__} HTTP: {e}")
+    raise RuntimeError("All download methods failed: "+" | ".join(errors[-8:]))
 
-
-def download_bytes(url, timeout=25):
-    fd, path = tempfile.mkstemp(prefix="findupto-net-")
-    os.close(fd)
+def download_bytes(url,allow_http=False):
+    fd,p=tempfile.mkstemp(prefix="findupto-"); os.close(fd)
     try:
-        download_file(url, path)
-        with open(path, "rb") as f:
-            return f.read()
+        download_file(url,p,allow_http); return open(p,"rb").read()
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
+        try: os.remove(p)
+        except OSError: pass
 
 def ensure_openvpn():
-    existing = openvpn_path()
-    if existing:
-        log(f"OpenVPN found: {existing}")
-        return existing
-    if not is_windows():
-        raise RuntimeError("Windows is required for VPN connections.")
-    if not is_admin():
-        raise PermissionError("Administrator permission is required to install OpenVPN.")
-
-    local_candidates = [
-        os.path.join(BASE_DIR, "openvpn-amd64.msi"),
-        os.path.join(BASE_DIR, "installer", "openvpn-amd64.msi"),
-        os.path.join(os.path.dirname(BASE_DIR), "installer", "openvpn-amd64.msi"),
-    ]
-    installer = next((p for p in local_candidates if os.path.isfile(p) and os.path.getsize(p) > 1_000_000), None)
-    temp_dir = tempfile.mkdtemp(prefix="findupto-openvpn-")
+    found=find_openvpn()
+    if found: return found
+    if not is_admin(): raise PermissionError("Administrator permission is required for automatic OpenVPN repair.")
+    local=[os.path.join(BASE_DIR,"openvpn-amd64.msi"),os.path.join(BASE_DIR,"installer","openvpn-amd64.msi"),os.path.join(os.path.dirname(BASE_DIR),"installer","openvpn-amd64.msi")]
+    installer=next((p for p in local if os.path.isfile(p) and os.path.getsize(p)>4000000),None)
+    td=tempfile.mkdtemp(prefix="findupto-openvpn-")
     try:
         if not installer:
-            installer = os.path.join(temp_dir, "openvpn.msi")
-            errors = []
-            for url in OPENVPN_INSTALLER_URLS:
+            installer=os.path.join(td,"openvpn.msi"); errors=[]
+            for url in OPENVPN_URLS:
                 try:
-                    log(f"Downloading OpenVPN MSI: {url}")
-                    download_file(url, installer, allow_http=False)
-                    if os.path.getsize(installer) >= 1_000_000:
-                        break
-                except Exception as exc:
-                    errors.append(str(exc))
-                    try: os.remove(installer)
-                    except OSError: pass
-            else:
-                raise RuntimeError("Unable to download the official OpenVPN installer. " + " | ".join(errors[-2:]))
+                    download_file(url,installer,False)
+                    if os.path.getsize(installer)>4000000: break
+                except Exception as e: errors.append(str(e))
+            else: raise RuntimeError("OpenVPN download failed through every available method/source: "+" | ".join(errors[-5:]))
+        mlog=os.path.join(td,"openvpn-msi.log")
+        r=subprocess.run(["msiexec.exe","/i",installer,"/qn","/norestart","/L*v",mlog],capture_output=True,text=True,timeout=300)
+        log(f"OpenVPN MSI exit={r.returncode}")
+        if r.returncode not in (0,3010): raise RuntimeError(f"OpenVPN installation failed (MSI {r.returncode}).")
+        for _ in range(40):
+            found=find_openvpn()
+            if found: return found
+            time.sleep(.5)
+        raise RuntimeError("OpenVPN installer finished but openvpn.exe is still unavailable. Check Windows services or reboot once.")
+    finally: shutil.rmtree(td,ignore_errors=True)
 
-        log(f"Installing OpenVPN from {installer}")
-        log_path = os.path.join(temp_dir, "openvpn-msi.log")
-        result = subprocess.run(["msiexec.exe", "/i", installer, "/qn", "/norestart", "/L*v", log_path], capture_output=True, text=True, timeout=240)
-        log(f"OpenVPN MSI exit code: {result.returncode}")
-        if result.returncode not in (0, 3010):
-            detail = (result.stderr or result.stdout or "").strip()
-            if os.path.isfile(log_path):
-                try:
-                    with open(log_path, "r", encoding="utf-16", errors="ignore") as f:
-                        lines = f.readlines()[-30:]
-                    detail += "\n" + "".join(lines)
-                except OSError:
-                    pass
-            raise RuntimeError(f"OpenVPN installation failed (MSI {result.returncode}).\n{detail[-3500:]}")
+def parse_servers(text):
+    lines=text.replace("\r\n","\n").replace("\r","\n").splitlines(); i=next((n for n,x in enumerate(lines) if x.startswith("#HostName,")),None)
+    if i is None: raise RuntimeError("Invalid VPN Gate server list")
+    rows=csv.DictReader(io.StringIO("\n".join([lines[i][1:]]+[x for x in lines[i+1:] if x.strip() and not x.startswith("#") and not x.startswith("*")]))); out=[]
+    for row in rows:
+        ip=(row.get("IP") or "").strip(); country=(row.get("CountryLong") or row.get("CountryShort") or "").strip()
+        if not ip or not country: continue
+        try: ping=float(row.get("Ping") or "")
+        except Exception: ping=None
+        try: speed=float(row.get("Speed") or 0)/1000000
+        except Exception: speed=0
+        try: score=int(float(row.get("Score") or 0))
+        except Exception: score=0
+        if ping is not None and ping>700: continue
+        out.append({"id":"vpngate-"+ip,"country":country,"city":(row.get("City") or "Unknown").strip() or "Unknown","ip":ip,"protocol":"openvpn","ping_ms":ping,"speed_mbps":speed,"score":score,"source":"VPN Gate","config_url":f"https://www.vpngate.net/common/openvpn_download.aspx?ip={ip}"})
+    out.sort(key=lambda x:(x["ping_ms"] if x["ping_ms"] is not None else 99999,-x["speed_mbps"],-x["score"])); return out[:100]
 
-        for _ in range(45):
-            found = openvpn_path()
-            if found:
-                return found
-            time.sleep(1)
-        raise RuntimeError("OpenVPN installer completed, but openvpn.exe is not visible yet. Windows may require a restart. See log: " + LOG_FILE)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def parse_vpngate_csv(text):
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-    header_index = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
-    if header_index is None:
-        raise RuntimeError("VPN Gate returned an unexpected server-list format.")
-    header = lines[header_index][1:]
-    data_lines = [line for line in lines[header_index + 1:] if line.strip() and not line.startswith("#") and not line.startswith("*")]
-    servers = []
-    for row in csv.DictReader(io.StringIO("\n".join([header] + data_lines))):
-        ip = (row.get("IP") or "").strip()
-        country = (row.get("CountryLong") or row.get("CountryShort") or "").strip()
-        if not ip or not country:
-            continue
-        try: ping = float(row.get("Ping") or "")
-        except (TypeError, ValueError): ping = None
-        try: speed = float(row.get("Speed") or "") / 1_000_000
-        except (TypeError, ValueError): speed = None
-        try: score = int(float(row.get("Score") or 0))
-        except (TypeError, ValueError): score = 0
-        if ping is not None and ping > 500: continue
-        servers.append({"id": f"vpngate-{ip}", "country": country, "city": (row.get("City") or "Unknown").strip() or "Unknown", "hostname": (row.get("HostName") or "").strip(), "ip": ip, "protocol": "openvpn", "ping_ms": ping, "speed_mbps": speed, "score": score, "source": "VPN Gate", "config_url": f"https://www.vpngate.net/common/openvpn_download.aspx?ip={ip}"})
-    servers.sort(key=lambda s: (s.get("ping_ms") if s.get("ping_ms") is not None else 9999, -(s.get("speed_mbps") or 0), -(s.get("score") or 0)))
-    return servers[:100]
-
-
-def save_cache(servers):
+def save_cache(s):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump({"time": time.time(), "servers": servers}, f)
+        os.makedirs(DATA_DIR,exist_ok=True); json.dump({"time":time.time(),"servers":s},open(CACHE_FILE,"w",encoding="utf-8"))
     except OSError: pass
 
-
-def load_cache(max_age=1800):
+def load_cache():
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f: data = json.load(f)
-        if time.time() - float(data.get("time", 0)) <= max_age and isinstance(data.get("servers"), list): return data["servers"]
-    except (OSError, ValueError, TypeError): pass
-    return []
-
+        d=json.load(open(CACHE_FILE,encoding="utf-8"))
+        return d["servers"] if time.time()-float(d.get("time",0))<1800 else []
+    except Exception: return []
 
 def fetch_servers():
-    api_urls = [API_URL.rstrip("/") + "/api/v1/public/servers?limit=100", API_URL.rstrip("/") + "/api/v1/public/servers"]
-    errors = []
-    for url in api_urls:
+    errors=[]
+    for url in (API_URL.rstrip("/")+"/api/v1/public/servers?limit=100",API_URL.rstrip("/")+"/api/v1/public/servers"):
         try:
-            result = json.loads(download_bytes(url, 15).decode("utf-8"))
-            if isinstance(result, list) and result:
-                save_cache(result); return result
-        except Exception as exc: errors.append(str(exc))
-    cached = load_cache()
+            d=json.loads(download_bytes(url).decode("utf-8"))
+            if isinstance(d,list) and d: save_cache(d); return d
+        except Exception as e: errors.append(str(e))
+    cached=load_cache()
     if cached: return cached
     for url in VPN_GATE_URLS:
         try:
-            servers = parse_vpngate_csv(download_bytes(url, 20).decode("utf-8-sig", errors="replace"))
-            if servers: save_cache(servers); return servers
-        except Exception as exc: errors.append(str(exc)); log(f"Server source failed: {url}: {exc}")
-    raise RuntimeError("Unable to load free servers. " + " | ".join(errors[-3:]))
+            s=parse_servers(download_bytes(url,True).decode("utf-8-sig",errors="replace"))
+            if s: save_cache(s); return s
+        except Exception as e: errors.append(str(e)); log("server source failed: "+str(e))
+    raise RuntimeError("No server source available: "+" | ".join(errors[-5:]))
 
-
-def download_config(url):
-    return download_bytes(url, 30)
-
+def fetch_config(url):
+    data=download_bytes(url,True)
+    if data[:2]==b"PK":
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names=[n for n in z.namelist() if n.lower().endswith(".ovpn")]
+            if not names: raise RuntimeError("Server returned no OpenVPN profile")
+            return z.read(names[0])
+    if b"remote " not in data.lower() and b"client" not in data.lower(): raise RuntimeError("Invalid OpenVPN profile received")
+    return data
 
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
-        self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1080x640")
-        self.minsize(850, 520)
-        self.configure(padx=18, pady=18)
-        self.servers = []
-        self.connected = False
-        self.config_path = None
-        self.process = None
-        self.build_ui()
-        self.refresh()
-
+        super().__init__(); self.title(f"{APP_NAME} {APP_VERSION}"); self.geometry("1080x650"); self.minsize(850,520); self.servers=[]; self.process=None; self.config_path=None; self.build_ui(); threading.Thread(target=self.startup,daemon=True).start()
     def build_ui(self):
-        ttk.Label(self, text=APP_NAME, font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(self, text="Multi-method networking • automatic OpenVPN repair • Windows native fallbacks").pack(anchor="w", pady=(2, 14))
-        frame = ttk.Frame(self); frame.pack(fill="both", expand=True)
-        columns = ("country", "city", "ip", "protocol", "ping", "speed", "source")
-        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=17)
-        for col, title, width in [("country", "Country", 150), ("city", "City", 140), ("ip", "IP Address", 125), ("protocol", "Protocol", 90), ("ping", "Ping", 75), ("speed", "Speed", 95), ("source", "Source", 120)]:
-            self.tree.heading(col, text=title); self.tree.column(col, width=width, anchor="w")
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview); scroll.pack(side="right", fill="y"); self.tree.configure(yscrollcommand=scroll.set)
-        buttons = ttk.Frame(self); buttons.pack(fill="x", pady=(14, 8))
-        for text, command in [("Refresh Servers", self.refresh), ("Best Server", self.connect_best), ("Connect", self.connect), ("Disconnect", self.disconnect), ("Diagnostics", self.diagnostics)]:
-            ttk.Button(buttons, text=text, command=command).pack(side="left", padx=(0, 8))
-        self.status = tk.StringVar(value="Finding free servers…"); ttk.Label(self, textvariable=self.status).pack(anchor="w")
-
-    def refresh(self):
-        self.status.set("Loading servers using multiple network methods…")
-        threading.Thread(target=self._refresh_worker, daemon=True).start()
-
-    def _refresh_worker(self):
-        try: self.after(0, lambda: self._show_servers(fetch_servers()))
-        except Exception as exc: self.after(0, lambda: self.status.set(f"Unable to load servers: {exc}"))
-
-    def _show_servers(self, servers):
-        self.servers = servers
-        for item in self.tree.get_children(): self.tree.delete(item)
-        for i, s in enumerate(servers):
-            ping = f"{s['ping_ms']:.0f} ms" if s.get("ping_ms") is not None else "-"
-            speed = f"{s['speed_mbps']:.1f} Mbps" if s.get("speed_mbps") is not None else "-"
-            self.tree.insert("", "end", iid=str(i), values=(s.get("country", ""), s.get("city", "Unknown"), s.get("ip", ""), s.get("protocol", "").upper(), ping, speed, s.get("source", "")))
-        if servers: self.tree.selection_set("0")
-        self.status.set(f"{len(servers)} server(s) ready")
-
-    def selected_server(self):
-        selection = self.tree.selection()
-        if not selection: messagebox.showinfo(APP_NAME, "Select a server first."); return None
-        return self.servers[int(selection[0])]
-
-    def connect_best(self):
-        if not self.servers: messagebox.showinfo(APP_NAME, "No servers are available yet."); return
-        self.tree.selection_set("0"); self.tree.see("0"); self.connect()
-
+        ttk.Label(self,text=APP_NAME,font=("Segoe UI",20,"bold")).pack(anchor="w"); ttk.Label(self,text="Automatic multi-method networking • background repair • fast fallback").pack(anchor="w",pady=(2,14))
+        frame=ttk.Frame(self); frame.pack(fill="both",expand=True); cols=("country","city","ip","protocol","ping","speed","source"); self.tree=ttk.Treeview(frame,columns=cols,show="headings")
+        for c,t,w in [("country","Country",150),("city","City",140),("ip","IP",130),("protocol","Protocol",90),("ping","Ping",80),("speed","Speed",95),("source","Source",120)]: self.tree.heading(c,text=t); self.tree.column(c,width=w)
+        self.tree.pack(side="left",fill="both",expand=True); sb=ttk.Scrollbar(frame,orient="vertical",command=self.tree.yview); sb.pack(side="right",fill="y"); self.tree.configure(yscrollcommand=sb.set)
+        b=ttk.Frame(self); b.pack(fill="x",pady=(14,8)); ttk.Button(b,text="Refresh",command=self.refresh).pack(side="left"); ttk.Button(b,text="Best Server",command=self.best).pack(side="left",padx=8); ttk.Button(b,text="Connect",command=self.connect).pack(side="left"); ttk.Button(b,text="Disconnect",command=self.disconnect).pack(side="left",padx=8); ttk.Button(b,text="Diagnostics",command=self.diagnostics).pack(side="right")
+        self.status=tk.StringVar(value="Starting automatic network checks…"); ttk.Label(self,textvariable=self.status).pack(anchor="w")
+    def startup(self):
+        try:
+            s=fetch_servers(); self.after(0,lambda:self.show_servers(s))
+        except Exception as e: log("startup: "+str(e)); self.after(0,lambda:self.status.set("Network unavailable; automatic fallback exhausted"))
+    def refresh(self): self.status.set("Trying network methods automatically…"); threading.Thread(target=self.startup,daemon=True).start()
+    def show_servers(self,s):
+        self.servers=s
+        for x in self.tree.get_children(): self.tree.delete(x)
+        for i,v in enumerate(s): self.tree.insert("","end",iid=str(i),values=(v.get("country",""),v.get("city","Unknown"),v.get("ip",""),"OPENVPN",("-" if v.get("ping_ms") is None else f"{v['ping_ms']:.0f} ms"),("-" if not v.get("speed_mbps") else f"{v['speed_mbps']:.1f} Mbps"),v.get("source","")))
+        if s:self.tree.selection_set("0")
+        self.status.set(f"{len(s)} servers ready")
+    def selected(self):
+        q=self.tree.selection()
+        if not q: messagebox.showinfo(APP_NAME,"Select a server first."); return None
+        return self.servers[int(q[0])]
+    def best(self):
+        if not self.servers: return messagebox.showinfo(APP_NAME,"Servers are still loading.")
+        self.tree.selection_set("0"); self.connect()
     def connect(self):
-        if not is_windows(): messagebox.showerror(APP_NAME, "Windows is required for VPN connections."); return
-        server = self.selected_server()
-        if not server: return
+        s=self.selected()
+        if not s:return
         if not is_admin():
-            if relaunch_as_admin(): self.destroy()
-            else: messagebox.showerror(APP_NAME, "Administrator permission is required to create the VPN tunnel.")
+            if elevate(): self.destroy()
+            else: messagebox.showerror(APP_NAME,"Administrator permission is required for the VPN tunnel.")
             return
-        if server.get("protocol", "").lower() == "openvpn": self.connect_openvpn(server)
-        else: messagebox.showerror(APP_NAME, "Unsupported VPN protocol: " + str(server.get("protocol", "unknown")))
-
-    def connect_openvpn(self, server):
-        self.status.set("Checking and repairing OpenVPN runtime…")
-        threading.Thread(target=self._prepare_openvpn, args=(server,), daemon=True).start()
-
-    def _prepare_openvpn(self, server):
+        self.status.set("Preparing VPN automatically…"); threading.Thread(target=self.connect_worker,args=(s,),daemon=True).start()
+    def connect_worker(self,s):
+        path=None
         try:
-            ovpn = ensure_openvpn(); self.after(0, lambda: self._start_openvpn(ovpn, server))
-        except Exception as exc:
-            log(f"OpenVPN prepare failed: {exc}")
-            self.after(0, lambda: messagebox.showerror(APP_NAME, f"OpenVPN could not be installed or found.\n\n{exc}\n\nDiagnostics log:\n{LOG_FILE}"))
-            self.after(0, lambda: self.status.set("OpenVPN runtime unavailable"))
-
-    def _start_openvpn(self, ovpn, server):
-        self.status.set(f"Downloading VPN configuration for {server.get('city', 'server')}…")
-        threading.Thread(target=self._openvpn_worker, args=(ovpn, server), daemon=True).start()
-
-    def _openvpn_worker(self, ovpn, server):
-        path = None
-        try:
-            data = download_config(server["config_url"])
-            if data.startswith(b"PK"):
-                with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                    configs = [n for n in archive.namelist() if n.lower().endswith(".ovpn")]
-                    if not configs: raise RuntimeError("No OpenVPN configuration was provided by the server.")
-                    config = archive.read(configs[0])
-            else: config = data
-            if b"client" not in config.lower(): raise RuntimeError("Downloaded configuration is not a valid OpenVPN profile.")
-            fd, path = tempfile.mkstemp(prefix="findupto-", suffix=".ovpn"); os.close(fd)
-            with open(path, "wb") as f: f.write(config)
-            self._stop_process()
-            log_path = path + ".log"
-            self.process = subprocess.Popen([ovpn, "--config", path, "--log", log_path, "--auth-nocache"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            self.config_path = path; self.connected = True
-            self.after(0, lambda: self.status.set(f"Connecting to {server.get('city', server.get('country', 'server'))}…"))
-            threading.Thread(target=self._watch_openvpn, daemon=True).start()
-        except Exception as exc:
-            log(f"OpenVPN connection failed: {exc}")
+            ovpn=ensure_openvpn(); config=fetch_config(s["config_url"]); fd,path=tempfile.mkstemp(prefix="findupto-",suffix=".ovpn"); os.close(fd); open(path,"wb").write(config); self.stop_process(); logpath=path+".log"; self.process=subprocess.Popen([ovpn,"--config",path,"--auth-nocache","--log",logpath],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0)); self.config_path=path; self.after(0,lambda:self.status.set(f"Connecting to {s.get('city',s.get('country','server'))}…")); threading.Thread(target=self.watch,args=(self.process,),daemon=True).start()
+        except Exception as e:
             if path:
                 try: os.remove(path)
                 except OSError: pass
-            self.after(0, lambda: messagebox.showerror(APP_NAME, f"Connection failed.\n\n{exc}\n\nLog: {LOG_FILE}")); self.after(0, lambda: self.status.set("Connection failed"))
-
-    def _watch_openvpn(self):
-        process = self.process
-        if not process: return
-        code = process.wait()
-        if self.connected:
-            self.connected = False; self.after(0, lambda: self.status.set(f"VPN stopped (exit code {code})"))
-
-    def _stop_process(self):
+            log("connection failed: "+str(e)); self.after(0,lambda:messagebox.showerror(APP_NAME,f"Automatic connection failed.\n\n{e}\n\nLog: {LOG_FILE}")); self.after(0,lambda:self.status.set("Connection failed"))
+    def watch(self,p):
+        code=p.wait(); self.after(0,lambda:self.status.set(f"VPN stopped (exit code {code})"))
+    def stop_process(self):
         if self.process and self.process.poll() is None:
             self.process.terminate()
-            try: self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired: self.process.kill()
-        self.process = None
-
+            try:self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:self.process.kill()
+        self.process=None
     def disconnect(self):
         if not is_admin():
-            if relaunch_as_admin(): self.destroy()
+            if elevate(): self.destroy()
             return
-        self._stop_process(); self.connected = False
+        self.stop_process()
         if self.config_path:
-            try: os.remove(self.config_path)
-            except OSError: pass
-            self.config_path = None
+            try:os.remove(self.config_path)
+            except OSError:pass
+            self.config_path=None
         self.status.set("Disconnected")
-
     def diagnostics(self):
-        info = [f"Findupto {APP_VERSION}", f"Admin: {is_admin()}", f"OpenVPN: {openvpn_path() or 'NOT FOUND'}", f"WireGuard: {wireguard_path() or 'NOT FOUND'}", f"curl: {_which('curl.exe') or _which('curl') or 'NOT FOUND'}", f"PowerShell: {_which('powershell.exe') or 'NOT FOUND'}", f"Log: {LOG_FILE}"]
-        messagebox.showinfo(APP_NAME + " Diagnostics", "\n".join(info))
+        messagebox.showinfo("Diagnostics",f"OpenVPN: {find_openvpn() or 'NOT FOUND'}\nWireGuard: {find_wireguard() or 'NOT FOUND'}\ncurl: {which('curl.exe') or which('curl') or 'NOT FOUND'}\nPowerShell: {which('powershell.exe') or which('pwsh.exe') or 'NOT FOUND'}\nAdmin: {is_admin()}\nLog: {LOG_FILE}")
 
-
-if __name__ == "__main__":
-    App().mainloop()
+if __name__=="__main__": App().mainloop()
