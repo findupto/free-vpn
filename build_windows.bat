@@ -12,17 +12,19 @@ if exist dist rmdir /s /q dist
 if exist FinduptoVPN.spec del /q FinduptoVPN.spec
 if exist installer\dist rmdir /s /q installer\dist
 
- echo [3/6] Building Windows client...
+echo [3/6] Building Windows client...
 pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client\app.py
 if errorlevel 1 exit /b 1
 if not exist dist\FinduptoVPN.exe (echo EXE build failed.& exit /b 1)
 
- echo [4/6] Downloading official VPN runtimes...
+echo [4/6] Downloading official VPN runtimes with fallback methods...
 if not exist installer mkdir installer
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' -OutFile 'installer\wireguard-amd64.msi'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -UseBasicParsing -Uri 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' -OutFile 'installer\wireguard-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer\wireguard-amd64.msi' 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' }"
 if errorlevel 1 exit /b 1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' -OutFile 'installer\openvpn-amd64.msi'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -UseBasicParsing -Uri 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' -OutFile 'installer\openvpn-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer\openvpn-amd64.msi' 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' }"
 if errorlevel 1 exit /b 1
+if not exist installer\openvpn-amd64.msi (echo OpenVPN MSI missing.& exit /b 1)
+if not exist installer\wireguard-amd64.msi (echo WireGuard MSI missing.& exit /b 1)
 
  echo [5/6] Locating Inno Setup...
 set "ISCC="
@@ -41,6 +43,6 @@ if not exist installer\dist\Findupto-Free-VPN-Setup.exe (echo Installer build fa
 
 echo.
 echo BUILD SUCCESSFUL
- echo Client:  dist\FinduptoVPN.exe
- echo Installer: installer\dist\Findupto-Free-VPN-Setup.exe
+echo Client:    dist\FinduptoVPN.exe
+echo Installer: installer\dist\Findupto-Free-VPN-Setup.exe
 endlocal
