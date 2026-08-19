@@ -7,7 +7,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-import vpn_engine as engine
+import standalone_engine as engine
 
 APP = "Findupto VPN"
 VERSION = engine.APP_VERSION
@@ -69,12 +69,12 @@ class App(tk.Tk):
         if self.busy:
             return
         self._set_busy(True)
-        self.status.set("Discovering live VPN Gate + VPNBook servers...")
+        self.status.set("Discovering live public VPN servers...")
         threading.Thread(target=self._discover_worker, daemon=True).start()
 
     def _discover_worker(self):
         try:
-            data = engine.discover(12)
+            data = engine.discover(10)
             self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates"))
         except Exception as exc:
             engine.log(f"DISCOVERY FATAL {type(exc).__name__}: {exc}")
@@ -92,8 +92,8 @@ class App(tk.Tk):
         if not self.servers:
             messagebox.showwarning(APP, "No servers available. Refresh first.")
             return
-        gate = [s for s in self.servers if s.get("kind") == "gate"][:12]
-        book = [s for s in self.servers if s.get("kind") == "book"][:6]
+        gate = [s for s in self.servers if s.get("kind") == "gate"][:24]
+        book = [s for s in self.servers if s.get("kind") == "book"][:8]
         self._connect(gate + book)
 
     def selected(self):
@@ -123,22 +123,11 @@ class App(tk.Tk):
                 return
             try:
                 self.events.put(("status", None, f"Trying {server['host']} ({server['source']})..."))
-                process, tmp, logfile = engine.connect(server, 35)
+                process, tmp, logfile = engine.connect(server, 45)
                 try:
-                    # OpenVPN's own initialization message plus a changed public IP are
-                    # the authoritative connectivity checks. Route inspection is useful
-                    # diagnostics, but Windows can transiently hide the route table from
-                    # a second subprocess even while the tunnel is already carrying traffic.
                     if process.poll() is not None:
-                        raise RuntimeError("OpenVPN exited immediately after initialization")
-                    snapshot = engine.route_snapshot()
-                    ip = engine.public_ip(8)
-                    if baseline and ip == baseline:
-                        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
-                    if not snapshot:
-                        engine.log(f"POST-CONNECT ROUTE CHECK advisory server={server['host']} route_snapshot=unavailable; public_ip_changed={baseline != ip if baseline else 'unknown'}")
-                    else:
-                        engine.log(f"POST-CONNECT ROUTE CHECK server={server['host']} routes={snapshot}")
+                        raise RuntimeError("VPN process exited immediately after initialization")
+                    ip = engine.verify_tunnel(baseline, 10)
                 except Exception as verify_exc:
                     engine.log(f"POST-CONNECT VERIFICATION FAIL server={server['host']} error={type(verify_exc).__name__}: {verify_exc}")
                     try:
