@@ -33,10 +33,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer | Out-Null
-          Invoke-WebRequest -Uri "https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi" -OutFile "installer/wireguard-amd64.msi"
-          Invoke-WebRequest -Uri "https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi" -OutFile "installer/openvpn-amd64.msi"
-          if ((Get-Item "installer/wireguard-amd64.msi").Length -lt 100000) { throw "WireGuard MSI download is invalid" }
-          if ((Get-Item "installer/openvpn-amd64.msi").Length -lt 1000000) { throw "OpenVPN MSI download is invalid" }
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' -OutFile 'installer/wireguard-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer/wireguard-amd64.msi' 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' }
+          try { Invoke-WebRequest -UseBasicParsing -Uri 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' -OutFile 'installer/openvpn-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer/openvpn-amd64.msi' 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' }
+          if ((Get-Item 'installer/wireguard-amd64.msi').Length -lt 100000) { throw 'WireGuard MSI download is invalid' }
+          if ((Get-Item 'installer/openvpn-amd64.msi').Length -lt 1000000) { throw 'OpenVPN MSI download is invalid' }
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -44,9 +46,9 @@ jobs:
       - name: Build standalone installer
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer/FinduptoVPN.iss
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' installer/FinduptoVPN.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (!(Test-Path "installer/dist/Findupto-Free-VPN-Setup.exe")) { throw "Installer was not created" }
+          if (!(Test-Path 'installer/dist/Findupto-Free-VPN-Setup.exe')) { throw 'Installer was not created' }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
