@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from gui import App
 
-VERSION = "10.0.0"
+VERSION = "11.0.0"
 
 if __name__ == "__main__":
     App().mainloop()
