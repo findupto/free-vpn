@@ -74,14 +74,14 @@ def discover(deadline:float=12)->list[dict]:
  start=time.monotonic();merged={s['id']:s for s in vpnbook_servers()}
  for s in _cache_load():merged[s.get('id',f"cache:{s.get('ip','')}")]=s
  log(f'DISCOVERY START cache={len(merged)}')
- with ThreadPoolExecutor(max_workers=2) as ex:
-  futures=[ex.submit(http_get,u,min(deadline,10),8000000) for u in GATE_URLS]
-  done,_=wait(futures,timeout=deadline+1)
-  for fut in done:
-   try:
-    for s in parse_gate(fut.result()):merged[s['id']]=s
-    log('DISCOVERY GATE OK')
-   except Exception as e:log(f'DISCOVERY GATE FAIL {type(e).__name__}: {e}')
+ ex=ThreadPoolExecutor(max_workers=2);futures=[ex.submit(http_get,u,min(deadline,10),8000000) for u in GATE_URLS]
+ done,_=wait(futures,timeout=deadline+1)
+ for fut in done:
+  try:
+   for s in parse_gate(fut.result()):merged[s['id']]=s
+   log('DISCOVERY GATE OK')
+  except Exception as e:log(f'DISCOVERY GATE FAIL {type(e).__name__}: {e}')
+ ex.shutdown(wait=False,cancel_futures=True)
  data=sorted(merged.values(),key=lambda s:(s.get('rank',-999),-s.get('ping',9999)),reverse=True)[:180];_cache_save(data);log(f'DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-start:.2f}s');return data
 def openvpn_exe()->str|None:
  for p in (shutil.which('openvpn.exe'),shutil.which('openvpn'),r'C:\Program Files\OpenVPN\bin\openvpn.exe'):
