@@ -1,10 +1,19 @@
 import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from client.vpn_engine import _prepare, parse_gate, vpnbook_servers, vpnbook_servers_from_html
+from client.vpn_engine import (
+    CACHE,
+    _cache_load,
+    _prepare,
+    http_get,
+    parse_gate,
+    vpnbook_servers,
+    vpnbook_servers_from_html,
+)
 
 
 class CoreTests(unittest.TestCase):
@@ -56,6 +65,44 @@ class CoreTests(unittest.TestCase):
             self.assertIn('disable-dco', text)
             self.assertIn('data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC', text)
             self.assertIn('data-ciphers-fallback AES-256-CBC', text)
+
+    def test_cache_discards_planted_public_vpn_entries(self):
+        payload = {
+            'time': 4102444800,
+            'servers': [
+                {'id': 'public-vpn-229', 'host': 'fake.example', 'kind': 'gate', 'ip': '1.2.3.4', 'config': 'fake'},
+                {'id': 'gate:1.2.3.4:real', 'host': 'real.example', 'kind': 'gate', 'ip': '1.2.3.4', 'config': 'real'},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'servers.json'
+            cache.write_text(json.dumps(payload), encoding='utf-8')
+            with patch('client.vpn_engine.CACHE', cache):
+                servers = _cache_load()
+        self.assertEqual([s['id'] for s in servers], ['gate:1.2.3.4:real'])
+
+    def test_http_get_keeps_curl_option_arguments_in_order(self):
+        class Result:
+            returncode = 0
+            stdout = b'ok'
+            stderr = b''
+
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return Result()
+
+        with patch('client.vpn_engine._curl', return_value='curl.exe'), \
+             patch('client.vpn_engine._curl_supports_compressed', return_value=True), \
+             patch('client.vpn_engine.subprocess.run', side_effect=fake_run):
+            data = http_get('https://example.test', timeout=10, limit=100)
+
+        self.assertEqual(data, b'ok')
+        args = calls[0]
+        timeout_index = args.index('--connect-timeout')
+        self.assertEqual(args[timeout_index + 1], '4')
+        self.assertLess(args.index('--compressed'), args.index('https://example.test'))
+        self.assertNotEqual(args[timeout_index + 1], '--compressed')
 
 
 if __name__ == '__main__':
