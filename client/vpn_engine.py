@@ -17,17 +17,17 @@ import threading
 import time
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FinduptoVPN"
 LOG = ROOT / "diagnostic.log"
 PROFILE_LOGS = ROOT / "openvpn-logs"
 CACHE = ROOT / "servers.json"
-UA = "FinduptoVPN/10.0"
+UA = "FinduptoVPN/11.0"
 GATE_URLS = ("https://www.vpngate.net/api/iphone/", "https://download.vpngate.jp/api/iphone/")
 VPNBOOK_PAGE = "https://www.vpnbook.com/freevpn/openvpn"
-CACHE_TTL = 6 * 60 * 60
+CACHE_TTL = 30 * 60
 _lock = threading.Lock()
 
 
@@ -50,7 +50,7 @@ def http_get(url: str, timeout: float = 12, limit: int = 10_000_000) -> bytes:
     started = time.monotonic()
     curl = _curl()
     if curl:
-        cmd = [curl, "--fail", "--silent", "--show-error", "--location",
+        cmd = [curl, "--fail", "--silent", "--show-error", "--location", "--compressed",
                "--connect-timeout", str(max(2, int(timeout * 0.4))),
                "--max-time", str(max(3, int(timeout))), "-A", UA, url]
         try:
@@ -86,7 +86,7 @@ def _resolve_host(host: str) -> str:
     try:
         return socket.gethostbyname(host)
     except OSError:
-        return host
+        return ""
 
 
 def parse_gate(raw: bytes) -> list[dict]:
@@ -121,31 +121,32 @@ def parse_gate(raw: bytes) -> list[dict]:
         try: score = float(item.get("Score") or 0)
         except ValueError: score = 0
         rank = speed * 8 + min(uptime, 100) * 0.08 + score * 0.01 - min(ping, 2000) * 0.35
-        result.append({"id": f"gate:{ip}:{host}", "ip": ip, "host": host,
-                       "country": item.get("CountryLong") or item.get("CountryShort") or "Unknown",
-                       "city": item.get("City") or "Unknown", "ping": ping, "speed": speed,
-                       "rank": rank, "config": config, "source": "VPN Gate", "kind": "gate"})
-    return sorted(result, key=lambda server: server["rank"], reverse=True)
+        result.append({
+            "id": f"gate:{ip}:{host}", "ip": ip, "host": host,
+            "country": item.get("CountryLong") or item.get("CountryShort") or "Unknown",
+            "city": item.get("City") or "Unknown", "ping": ping, "speed": speed,
+            "uptime": uptime, "score": score, "rank": rank, "config": config,
+            "source": "VPN Gate", "kind": "gate",
+        })
+    return sorted(result, key=lambda s: s["rank"], reverse=True)
 
 
 def vpnbook_servers() -> list[dict]:
     try:
         raw = http_get(VPNBOOK_PAGE, 12, 5_000_000).decode("utf-8", "replace")
-        found: dict[str, dict] = {}
-        # The page is authoritative for the current server names. If its download
-        # buttons are rendered by JavaScript, the canonical ZIP URL is still built
-        # only for a server ID that was actually published on that page.
         published = set(re.findall(r"\b([a-z]{2}\d{2,4})\.vpnbook\.com\b", raw, re.I))
-        for sid_raw in published:
+        found = []
+        for sid_raw in sorted(published):
             sid = sid_raw.lower()
-            bundle = f"https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-{sid}.zip"
             host = f"{sid}.vpnbook.com"
-            found[sid] = {"id": f"book:{sid}", "sid": sid, "ip": _resolve_host(host),
-                          "host": host, "country": "VPNBook", "city": sid.upper(),
-                          "ping": 9999, "speed": 0, "rank": -100, "bundle": bundle,
-                          "source": "VPNBook", "kind": "book"}
+            found.append({
+                "id": f"book:{sid}", "sid": sid, "ip": _resolve_host(host), "host": host,
+                "country": "VPNBook", "city": sid.upper(), "ping": 9999, "speed": 0,
+                "rank": -100, "bundle": f"https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-{sid}.zip",
+                "source": "VPNBook", "kind": "book",
+            })
         log(f"VPNBOOK CATALOG OK servers={len(found)}")
-        return list(found.values())
+        return found
     except Exception as exc:
         log(f"VPNBOOK CATALOG FAIL error={type(exc).__name__}: {exc}")
         return []
@@ -175,28 +176,62 @@ def discover(deadline: float = 12) -> list[dict]:
     started = time.monotonic()
     merged = {server["id"]: server for server in _cache_load()}
     log(f"DISCOVERY START cached={len(merged)}")
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(http_get, url, min(deadline, 10), 8_000_000) for url in GATE_URLS]
-        done, _ = wait(futures, timeout=deadline + 2)
-        for future in done:
+        futures.append(executor.submit(http_get, VPNBOOK_PAGE, min(deadline, 10), 5_000_000))
+        for future in as_completed(futures, timeout=deadline + 3):
             try:
-                for server in parse_gate(future.result()):
-                    merged[server["id"]] = server
+                raw = future.result()
+                if raw.lstrip().startswith(b"<"):
+                    for server in vpnbook_servers_from_html(raw.decode("utf-8", "replace")):
+                        merged[server["id"]] = server
+                else:
+                    for server in parse_gate(raw):
+                        merged[server["id"]] = server
             except Exception as exc:
-                log(f"DISCOVERY GATE FAIL error={type(exc).__name__}: {exc}")
-    for server in vpnbook_servers():
-        merged[server["id"]] = server
-    data = sorted(merged.values(), key=lambda s: (s.get("rank", -999), -s.get("ping", 9999)), reverse=True)[:200]
+                log(f"DISCOVERY SOURCE FAIL error={type(exc).__name__}: {exc}")
+    data = sorted(merged.values(), key=lambda s: (s.get("rank", -999), -s.get("ping", 9999)), reverse=True)[:250]
     _cache_save(data)
     log(f"DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-started:.2f}s")
     return data
 
 
+def vpnbook_servers_from_html(raw: str) -> list[dict]:
+    published = set(re.findall(r"\b([a-z]{2}\d{2,4})\.vpnbook\.com\b", raw, re.I))
+    result = []
+    for sid_raw in sorted(published):
+        sid = sid_raw.lower()
+        host = f"{sid}.vpnbook.com"
+        result.append({"id": f"book:{sid}", "sid": sid, "ip": _resolve_host(host), "host": host,
+                       "country": "VPNBook", "city": sid.upper(), "ping": 9999, "speed": 0,
+                       "rank": -100, "bundle": f"https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-{sid}.zip",
+                       "source": "VPNBook", "kind": "book"})
+    return result
+
+
 def openvpn_exe() -> str | None:
-    for path in (shutil.which("openvpn.exe"), shutil.which("openvpn"), r"C:\Program Files\OpenVPN\bin\openvpn.exe"):
+    candidates = [shutil.which("openvpn.exe"), shutil.which("openvpn")]
+    candidates += [
+        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+        r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
+    ]
+    for path in candidates:
         if path and os.path.isfile(path) and path.lower().endswith("openvpn.exe"):
             return path
     return None
+
+
+def _openvpn_version(exe: str) -> tuple[int, int, int]:
+    try:
+        cp = subprocess.run([exe, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        match = re.search(r"OpenVPN\s+(\d+)\.(\d+)(?:\.(\d+))?", cp.stdout)
+        if match:
+            return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
+    except Exception as exc:
+        log(f"OPENVPN VERSION FAIL error={type(exc).__name__}: {exc}")
+    return (0, 0, 0)
 
 
 def _vpnbook_profiles(server: dict) -> list[str]:
@@ -215,7 +250,7 @@ def _vpnbook_profiles(server: dict) -> list[str]:
 def _vpnbook_password() -> str:
     raw = http_get(VPNBOOK_PAGE, 12, 5_000_000).decode("utf-8", "replace")
     text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)))
-    match = re.search(r"\bPassword\s*[:\-]?\s*([A-Za-z0-9]{6,24})\b", text, re.I)
+    match = re.search(r"\bPassword\s*[:\-]?\s*([A-Za-z0-9]{6,32})\b", text, re.I)
     if not match:
         raise RuntimeError("VPNBook current password was not found on its official page")
     value = match.group(1)
@@ -235,16 +270,75 @@ def _profiles(server: dict) -> tuple[list[str], str, str]:
     return _vpnbook_profiles(server), "vpnbook", _vpnbook_password()
 
 
-def _prepare(profile: str, username: str, password: str, work: Path) -> Path:
+def _prepare(profile: str, username: str, password: str, work: Path, openvpn_version: tuple[int, int, int] = (0, 0, 0)) -> Path:
     auth = work / "auth.txt"
     auth.write_text(username + "\n" + password + "\n", encoding="utf-8")
-    blocked = ("auth-user-pass", "redirect-gateway", "route ", "route-ipv6 ", "route-nopull", "pull-filter", "register-dns")
-    lines = [line for line in profile.splitlines() if not line.strip().lower().startswith(blocked)]
-    lines.extend(["redirect-gateway def1", "route 0.0.0.0 128.0.0.0", "route 128.0.0.0 128.0.0.0",
-                  "route-metric 5", f'auth-user-pass "{auth}"', "auth-nocache", "resolv-retry infinite",
-                  "connect-retry 2 3", "connect-timeout 10", "persist-key", "persist-tun", "verb 4"])
-    if os.name == "nt":
+
+    lines = []
+    legacy_cipher = None
+    has_compression = False
+    has_dev = False
+    for original in profile.splitlines():
+        stripped = original.strip()
+        low = stripped.lower()
+        if not stripped or low.startswith("#") or low.startswith(";"):
+            lines.append(original)
+            continue
+        if low.startswith("cipher "):
+            legacy_cipher = stripped.split(None, 1)[1].strip()
+        if low.startswith("compress ") or low.startswith("comp-lzo"):
+            has_compression = True
+        if low.startswith("dev "):
+            has_dev = True
+        if low.startswith(("auth-user-pass", "redirect-gateway", "route ", "route-ipv6 ",
+                           "route-nopull", "pull-filter", "register-dns", "block-outside-dns",
+                           "route-metric ")):
+            continue
+        lines.append(original)
+
+    if not has_dev:
+        lines.append("dev tun")
+    lines.extend([
+        "client",
+        "redirect-gateway def1",
+        "route 0.0.0.0 128.0.0.0",
+        "route 128.0.0.0 128.0.0.0",
+        "route-metric 5",
+        f'auth-user-pass "{auth}"',
+        "auth-nocache",
+        "resolv-retry infinite",
+        "connect-retry 2 3",
+        "connect-timeout 10",
+        "persist-key",
+        "persist-tun",
+        "verb 4",
+    ])
+
+    # OpenVPN 2.6 enables DCO opportunistically. Many free relays still publish
+    # legacy ciphers/compression that are not DCO-compatible, causing immediate
+    # exit code 1 before any TLS connection is attempted.
+    if openvpn_version >= (2, 6, 0):
+        lines.append("disable-dco")
+
+    # OpenVPN 2.5+ requires old non-NCP server ciphers to be explicitly allowed.
+    # Keep modern AEAD ciphers first and add the exact cipher advertised by the
+    # live server only when present in its downloaded profile.
+    if legacy_cipher:
+        modern = "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+        if legacy_cipher.upper() not in modern.upper().split(":"):
+            lines.append(f"data-ciphers {modern}:{legacy_cipher}")
+            lines.append(f"data-ciphers-fallback {legacy_cipher}")
+            log(f"OPENVPN COMPAT legacy-cipher={legacy_cipher}")
+
+    if has_compression and openvpn_version >= (2, 6, 0):
+        lines.append("allow-compression asym")
+        log("OPENVPN COMPAT legacy-compression=enabled")
+
+    # block-outside-dns is useful but must not be allowed to turn every connection
+    # into an immediate startup failure on older/non-elevated OpenVPN builds.
+    if os.name == "nt" and openvpn_version >= (2, 4, 0):
         lines.append("block-outside-dns")
+
     config = work / "client.ovpn"
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config
@@ -252,11 +346,21 @@ def _prepare(profile: str, username: str, password: str, work: Path) -> Path:
 
 def _classify(text: str, code: int | None) -> str:
     low = text.lower()
-    for key, message in (("auth_failed", "authentication failed"), ("options error", "OpenVPN configuration error"),
-                         ("tls error", "TLS handshake failed"), ("connection refused", "connection refused"),
-                         ("network is unreachable", "network unreachable"), ("cannot open tun", "TUN/TAP adapter unavailable"),
-                         ("all tap-windows adapters", "TUN/TAP adapter unavailable"), ("access is denied", "administrator permission required"),
-                         ("route addition failed", "Windows route installation failed")):
+    patterns = (
+        ("options error", "OpenVPN configuration error"),
+        ("unknown option", "OpenVPN does not support an option in this profile"),
+        ("block-outside-dns requires", "administrator permission is required for DNS leak protection"),
+        ("auth_failed", "authentication failed"),
+        ("data channel cipher negotiation failed", "server cipher is incompatible"),
+        ("tls error", "TLS handshake failed"),
+        ("connection refused", "connection refused"),
+        ("network is unreachable", "network unreachable"),
+        ("cannot open tun", "TUN/TAP adapter unavailable"),
+        ("all tap-windows adapters", "TUN/TAP adapter unavailable"),
+        ("access is denied", "administrator permission required"),
+        ("route addition failed", "Windows route installation failed"),
+    )
+    for key, message in patterns:
         if key in low:
             return message
     return f"OpenVPN exited with code {code}" if code is not None else "connection timeout"
@@ -276,30 +380,44 @@ def route_snapshot() -> str:
         return ""
 
 
+def _read_log(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    except OSError:
+        return ""
+
+
 def connect(server: dict, total_deadline: float = 35):
     exe = openvpn_exe()
     if not exe:
         raise RuntimeError("OpenVPN Community is not installed. Install OpenVPN Community and retry.")
+    version = _openvpn_version(exe)
+    log(f"OPENVPN DETECTED exe={exe} version={'.'.join(map(str, version))}")
     started = time.monotonic()
     profiles, username, password = _profiles(server)
     PROFILE_LOGS.mkdir(parents=True, exist_ok=True)
     last = ""
+
     for index, profile in enumerate(profiles, 1):
         if time.monotonic() - started >= total_deadline:
             break
         work = Path(tempfile.mkdtemp(prefix="findupto-vpn-"))
-        config = _prepare(profile, username, password, work)
+        config = _prepare(profile, username, password, work, version)
         logfile = PROFILE_LOGS / f"{server['host'].replace(':', '_')}-{int(time.time())}-v{index}.log"
+        startup_log = PROFILE_LOGS / f"{server['host'].replace(':', '_')}-{int(time.time())}-v{index}-startup.log"
         process = None
         keep_work = False
         try:
-            process = subprocess.Popen([exe, "--config", str(config), "--log", str(logfile), "--log-append"],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with startup_log.open("w", encoding="utf-8", errors="replace") as stdout_file:
+                process = subprocess.Popen(
+                    [exe, "--config", str(config), "--log", str(logfile), "--log-append"],
+                    stdout=stdout_file, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
             log(f"OPENVPN START server={server['host']} variant={index}/{len(profiles)} pid={process.pid} log={logfile}")
-            deadline = min(started + total_deadline, time.monotonic() + 11)
+            deadline = min(started + total_deadline, time.monotonic() + 12)
             while time.monotonic() < deadline:
-                text = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
+                text = _read_log(logfile) + "\n" + _read_log(startup_log)
                 if "Initialization Sequence Completed" in text:
                     snapshot = route_snapshot()
                     if os.name == "nt" and not snapshot:
@@ -314,24 +432,32 @@ def connect(server: dict, total_deadline: float = 35):
                     last = _classify(text, process.returncode)
                     break
                 time.sleep(0.2)
+
             if process and process.poll() is None:
                 last = "connection timeout"
                 process.terminate()
-                try: process.wait(timeout=3)
-                except Exception: process.kill()
-            text = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    process.kill()
+            text = _read_log(logfile) + "\n" + _read_log(startup_log)
             if text:
                 last = _classify(text, process.returncode if process else None)
             log(f"OPENVPN ATTEMPT FAIL server={server['host']} variant={index} reason={last}")
+            if last == "OpenVPN configuration error":
+                log(f"OPENVPN CONFIG DIAGNOSTIC server={server['host']} log={logfile} startup={startup_log}")
         except Exception as exc:
             last = str(exc)
             log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} variant={index} error={type(exc).__name__}: {exc}")
         finally:
             if process and process.poll() is None and not keep_work:
-                try: process.kill()
-                except Exception: pass
+                try:
+                    process.kill()
+                except Exception:
+                    pass
             if not keep_work:
                 shutil.rmtree(work, ignore_errors=True)
+
     raise RuntimeError(last or "all OpenVPN profiles failed; see OpenVPN logs")
 
 
