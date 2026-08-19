@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +21,7 @@ def _is_admin() -> bool:
 
 
 def _elevate() -> None:
-    """Relaunch the application elevated so OpenVPN can create the tunnel and install routes."""
+    """Relaunch elevated so OpenVPN can create the tunnel and install Windows routes."""
     if os.name != "nt" or _is_admin():
         return
 
