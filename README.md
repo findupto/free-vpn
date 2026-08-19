@@ -1,28 +1,34 @@
 # Findupto VPN
 
-A clean Windows VPN client that discovers legitimate public VPN configurations, ranks them, verifies tunnel establishment, and automatically fails over.
+A Windows OpenVPN client that discovers **live free VPN servers**, ranks them by advertised performance, connects with automatic failover, and verifies that browser traffic is actually using the VPN tunnel.
 
-## Current design
+## What is real and functional
 
-- Provider adapters are isolated; one broken provider cannot block another.
-- No `ThreadPoolExecutor` or blocking future pool is used for discovery.
-- VPN Gate is consumed from its official public API.
-- VPNBook is consumed from its current official OpenVPN page and only published configuration links are accepted; the client never invents download URLs.
-- A 7-day local cache lets the UI start when public discovery is temporarily unavailable.
-- Server candidates are ranked using advertised latency, speed, uptime and score when available.
-- OpenVPN connection attempts use the provider profile first, followed by TCP 443, TCP 80, UDP 53 and UDP 25000 variants when the profile permits it.
-- `Connect Best` automatically tries up to 12 candidates and stops only after a tunnel is established and the public IP has changed.
-- `.ovpn` import is supported for legitimate configurations from other providers.
-- Network discovery is asynchronous and cannot freeze the Tkinter UI.
+- **VPN Gate live discovery:** server IPs, hostnames, ping, speed, uptime and OpenVPN configs are fetched from the public VPN Gate API instead of shipping a stale IP list.
+- **VPNBook live discovery:** the official OpenVPN page is parsed for currently published configuration bundles and the current password is read from the official credentials page at connection time.
+- **Fastest-first connection:** VPN Gate relays are ranked using live advertised ping/speed/uptime/score; the best candidates are tried automatically.
+- **Browser-ready system tunnel:** successful OpenVPN connections install a full-tunnel route on Windows, so normal Chrome, Edge, Firefox and other applications use the VPN without browser-specific extensions.
+- **Real verification:** the client checks the Windows full-tunnel routes and confirms that the public IP changed before showing `CONNECTED`.
+- **Automatic protocol fallback:** VPNBook profiles are tried in TCP 443, TCP 80, UDP 53 and UDP 25000 order when those profiles are published.
+- **No fake server/IP database:** public server addresses are intentionally not hardcoded because free relays and IPs change frequently.
+- **Clear diagnostics:** every OpenVPN attempt gets its own log and errors are classified instead of being hidden behind a generic exit-code message.
+- **Clean entry point:** `client/app.py` is the only application launcher; duplicate/dead backend and launcher scripts were removed.
 
 ## Windows requirements
 
-Install **OpenVPN Community** separately. The application does not bundle third-party VPN software or credentials.
+Install **OpenVPN Community** separately. The project does not bundle third-party VPN software or claim ownership of public relay infrastructure.
 
-The GitHub Actions workflow runs Python compilation, unit tests, and then produces `FinduptoVPN.exe`.
+Run the application with administrator privileges if Windows/OpenVPN requires elevation to create the TUN adapter or install routes.
 
-## Important limitation
+## Free server sources
 
-There is no technically honest way to guarantee that public free VPN servers work forever. Providers can change credentials, remove servers, become overloaded, or be blocked by a network. This client is designed so those conditions cause provider/server failover rather than an application crash.
+Current free server sources include:
 
-VPNBook currently publishes free OpenVPN and WireGuard service with changing credentials and server configurations, while VPN Gate publishes a live public relay list. The client therefore discovers current data instead of shipping a stale list.
+- urlVPN Gatehttps://www.vpngate.net/ — public volunteer relays with live IP/configuration data.
+- urlVPNBook OpenVPNhttps://www.vpnbook.com/freevpn/openvpn — currently published free OpenVPN servers and changing credentials.
+
+Free public VPNs can disappear, become overloaded, change credentials, or be blocked. The client therefore discovers current data and fails over rather than pretending a fixed server/IP is guaranteed to work.
+
+## Build
+
+GitHub Actions compiles the project, runs the unit tests, and builds `FinduptoVPN.exe` from `client/app.py`.
