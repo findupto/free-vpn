@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import tempfile
@@ -24,10 +25,7 @@ LOG = ROOT / "diagnostic.log"
 PROFILE_LOGS = ROOT / "openvpn-logs"
 CACHE = ROOT / "servers.json"
 UA = "FinduptoVPN/10.0"
-GATE_URLS = (
-    "https://www.vpngate.net/api/iphone/",
-    "https://download.vpngate.jp/api/iphone/",
-)
+GATE_URLS = ("https://www.vpngate.net/api/iphone/", "https://download.vpngate.jp/api/iphone/")
 VPNBOOK_PAGE = "https://www.vpnbook.com/freevpn/openvpn"
 CACHE_TTL = 6 * 60 * 60
 _lock = threading.Lock()
@@ -52,7 +50,6 @@ def http_get(url: str, timeout: float = 12, limit: int = 10_000_000) -> bytes:
     started = time.monotonic()
     curl = _curl()
     if curl:
-        # Some Windows curl builds reject --compressed. It is not required here.
         cmd = [curl, "--fail", "--silent", "--show-error", "--location",
                "--connect-timeout", str(max(2, int(timeout * 0.4))),
                "--max-time", str(max(3, int(timeout))), "-A", UA, url]
@@ -83,6 +80,13 @@ def http_get(url: str, timeout: float = 12, limit: int = 10_000_000) -> bytes:
     except Exception as exc:
         log(f"HTTP FAIL url={url} error={type(exc).__name__}: {exc}")
         raise
+
+
+def _resolve_host(host: str) -> str:
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return host
 
 
 def parse_gate(raw: bytes) -> list[dict]:
@@ -117,12 +121,10 @@ def parse_gate(raw: bytes) -> list[dict]:
         try: score = float(item.get("Score") or 0)
         except ValueError: score = 0
         rank = speed * 8 + min(uptime, 100) * 0.08 + score * 0.01 - min(ping, 2000) * 0.35
-        result.append({
-            "id": f"gate:{ip}:{host}", "ip": ip, "host": host,
-            "country": item.get("CountryLong") or item.get("CountryShort") or "Unknown",
-            "city": item.get("City") or "Unknown", "ping": ping, "speed": speed,
-            "rank": rank, "config": config, "source": "VPN Gate", "kind": "gate",
-        })
+        result.append({"id": f"gate:{ip}:{host}", "ip": ip, "host": host,
+                       "country": item.get("CountryLong") or item.get("CountryShort") or "Unknown",
+                       "city": item.get("City") or "Unknown", "ping": ping, "speed": speed,
+                       "rank": rank, "config": config, "source": "VPN Gate", "kind": "gate"})
     return sorted(result, key=lambda server: server["rank"], reverse=True)
 
 
@@ -130,20 +132,17 @@ def vpnbook_servers() -> list[dict]:
     try:
         raw = http_get(VPNBOOK_PAGE, 12, 5_000_000).decode("utf-8", "replace")
         found: dict[str, dict] = {}
-        for href, label in re.findall(r'''href=["']([^"']+)["'][^>]*>(.*?)<''', raw, re.I | re.S):
-            if not re.search(r"\.zip(?:[?#]|$)", href, re.I):
-                continue
-            url = html.unescape(href)
-            if not url.lower().startswith("http"):
-                url = "https://www.vpnbook.com" + (url if url.startswith("/") else "/" + url)
-            text = (url + " " + re.sub(r"<[^>]+>", " ", label)).lower()
-            match = re.search(r"vpnbook[-_]openvpn[-_]([a-z0-9-]+)\.zip", text, re.I)
-            if not match:
-                continue
-            sid = match.group(1).lower()
-            found[sid] = {"id": f"book:{sid}", "sid": sid, "ip": f"{sid}.vpnbook.com",
-                          "host": f"{sid}.vpnbook.com", "country": "VPNBook", "city": sid.upper(),
-                          "ping": 9999, "speed": 0, "rank": -100, "bundle": url,
+        # The page is authoritative for the current server names. If its download
+        # buttons are rendered by JavaScript, the canonical ZIP URL is still built
+        # only for a server ID that was actually published on that page.
+        published = set(re.findall(r"\b([a-z]{2}\d{2,4})\.vpnbook\.com\b", raw, re.I))
+        for sid_raw in published:
+            sid = sid_raw.lower()
+            bundle = f"https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-{sid}.zip"
+            host = f"{sid}.vpnbook.com"
+            found[sid] = {"id": f"book:{sid}", "sid": sid, "ip": _resolve_host(host),
+                          "host": host, "country": "VPNBook", "city": sid.upper(),
+                          "ping": 9999, "speed": 0, "rank": -100, "bundle": bundle,
                           "source": "VPNBook", "kind": "book"}
         log(f"VPNBOOK CATALOG OK servers={len(found)}")
         return list(found.values())
@@ -207,7 +206,7 @@ def _vpnbook_profiles(server: dict) -> list[str]:
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         names = [name for name in archive.namelist() if name.lower().endswith(".ovpn")]
         if not names:
-            raise RuntimeError("VPNBook bundle contains no .ovpn profiles")
+            raise RuntimeError("VPNBook bundle contains no OpenVPN profiles")
         order = ("tcp443", "tcp80", "udp53", "udp25000")
         names.sort(key=lambda name: next((i for i, token in enumerate(order) if token in name.lower()), 99))
         return [archive.read(name).decode("utf-8-sig", "replace") for name in names]
