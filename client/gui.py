@@ -10,7 +10,7 @@ from tkinter import messagebox, ttk
 import vpn_engine as engine
 
 APP = "Findupto VPN"
-VERSION = "11.0.0"
+VERSION = engine.APP_VERSION
 
 
 class App(tk.Tk):
@@ -36,20 +36,17 @@ class App(tk.Tk):
         ttk.Label(head, text=f"  Live Free VPN • {VERSION}").pack(side="left", pady=7)
         self.status = tk.StringVar(value="Starting...")
         ttk.Label(self, textvariable=self.status, padding=(14, 0, 14, 10)).pack(fill="x")
-
         frame = ttk.Frame(self, padding=(14, 0, 14, 0))
         frame.pack(fill="both", expand=True)
         cols = ("country", "city", "host", "ip", "ping", "speed", "source")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings")
-        widths = (130, 140, 250, 130, 85, 105, 110)
-        for col, width in zip(cols, widths):
+        for col, width in zip(cols, (130, 140, 250, 130, 85, 105, 110)):
             self.tree.heading(col, text=col.title())
             self.tree.column(col, width=width, anchor="w")
         y = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=y.set)
         self.tree.pack(side="left", fill="both", expand=True)
         y.pack(side="right", fill="y")
-
         bar = ttk.Frame(self, padding=14)
         bar.pack(fill="x")
         self.refresh_btn = ttk.Button(bar, text="Refresh Live Servers", command=self.refresh)
@@ -59,7 +56,7 @@ class App(tk.Tk):
         self.sel_btn = ttk.Button(bar, text="Connect Selected", command=self.selected)
         self.sel_btn.pack(side="left")
         ttk.Button(bar, text="Open Diagnostic Log", command=self.open_log).pack(side="left", padx=7)
-        ttk.Button(bar, text="Open OpenVPN Logs", command=self.open_openvpn_logs).pack(side="left")
+        ttk.Button(bar, text="Open Latest OpenVPN Log", command=self.open_openvpn_logs).pack(side="left")
         ttk.Button(bar, text="Disconnect", command=self.disconnect).pack(side="right")
 
     def _set_busy(self, value):
@@ -78,7 +75,7 @@ class App(tk.Tk):
     def _discover_worker(self):
         try:
             data = engine.discover(12)
-            self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates; full-tunnel verification is mandatory"))
+            self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates"))
         except Exception as exc:
             engine.log(f"DISCOVERY FATAL {type(exc).__name__}: {exc}")
             self.events.put(("error", None, f"Discovery failed: {exc}\n\n{engine.LOG}"))
@@ -89,19 +86,14 @@ class App(tk.Tk):
         for index, server in enumerate(data):
             ping = "-" if server.get("ping", 9999) >= 9999 else f"{server['ping']:.0f} ms"
             speed = "-" if not server.get("speed") else f"{server['speed']:.1f} Mbps"
-            self.tree.insert("", "end", iid=str(index), values=(
-                server.get("country", ""), server.get("city", ""), server.get("host", ""),
-                server.get("ip", ""), ping, speed, server.get("source", ""),
-            ))
+            self.tree.insert("", "end", iid=str(index), values=(server.get("country", ""), server.get("city", ""), server.get("host", ""), server.get("ip", ""), ping, speed, server.get("source", "")))
 
     def best(self):
         if not self.servers:
             messagebox.showwarning(APP, "No servers available. Refresh first.")
             return
-        # Prefer the live VPN Gate ranking, then use VPNBook as a separate fallback.
-        # Do not hardcode IPs: both catalogs are volatile public infrastructure.
-        gate = [s for s in self.servers if s.get("kind") == "gate"][:15]
-        book = [s for s in self.servers if s.get("kind") == "book"][:10]
+        gate = [s for s in self.servers if s.get("kind") == "gate"][:12]
+        book = [s for s in self.servers if s.get("kind") == "book"][:6]
         self._connect(gate + book)
 
     def selected(self):
@@ -115,7 +107,7 @@ class App(tk.Tk):
         if self.busy:
             return
         self._set_busy(True)
-        self.status.set(f"Testing {len(candidates)} live servers; success requires full-tunnel + public-IP verification...")
+        self.status.set(f"Trying {len(candidates)} live candidates; full-tunnel verification is mandatory...")
         threading.Thread(target=self._connect_worker, args=(candidates,), daemon=True).start()
 
     def _connect_worker(self, candidates):
@@ -126,7 +118,6 @@ class App(tk.Tk):
         except Exception as exc:
             baseline = None
             engine.log(f"CONNECT BASELINE unavailable error={type(exc).__name__}: {exc}")
-
         for server in candidates:
             if self.process is not None:
                 return
@@ -149,15 +140,13 @@ class App(tk.Tk):
                     raise
                 self.process, self.tmp, self.current_log = process, tmp, logfile
                 engine.log(f"VPN CONNECTED AND VERIFIED server={server['host']} public_ip={ip}")
-                self.events.put(("connected", None, f"CONNECTED — {server['host']} — public IP {ip} — browsers use the system tunnel"))
+                self.events.put(("connected", None, f"CONNECTED — {server['host']} — public IP {ip}"))
                 return
             except Exception as exc:
                 message = f"{server['host']}: {exc}"
                 errors.append(message)
                 engine.log(message)
-
-        self.events.put(("error", None, "No live candidate connected successfully.\n\n" + "\n".join(errors[:25]) +
-                        f"\n\nDiagnostic log:\n{engine.LOG}\nOpenVPN logs:\n{engine.PROFILE_LOGS}"))
+        self.events.put(("error", None, "No candidate connected successfully.\n\n" + "\n".join(errors[:20]) + f"\n\nDiagnostic log:\n{engine.LOG}\nLatest OpenVPN failure log:\n{engine.PROFILE_LOGS}"))
 
     def disconnect(self):
         process = self.process
@@ -192,7 +181,7 @@ class App(tk.Tk):
         try:
             os.startfile(engine.PROFILE_LOGS)
         except Exception:
-            messagebox.showinfo(APP, f"OpenVPN logs:\n{engine.PROFILE_LOGS}")
+            messagebox.showinfo(APP, f"Latest OpenVPN failure log:\n{engine.PROFILE_LOGS}")
 
     def _pump(self):
         try:
