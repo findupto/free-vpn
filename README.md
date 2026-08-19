@@ -1,38 +1,40 @@
-# Findupto Free VPN
+# Findupto Free VPN 3.0
 
-A Windows desktop VPN client and free-server directory focused on fast discovery, reliable connection handling, and automatic VPN runtime installation.
+A Windows desktop VPN client and free-server directory focused on fast discovery, smart server ranking, cache-first startup, and automatic OpenVPN failover.
 
-## What is fixed
+## What changed
 
-- Server discovery uses API-side caching and client-side cache fallback instead of waiting indefinitely for a remote source.
-- External server fetches have strict timeouts and stale cached servers remain usable when the upstream source is temporarily unavailable.
-- VPN Gate OpenVPN servers are handled as OpenVPN servers instead of being incorrectly treated as WireGuard nodes.
-- The Windows installer now installs both official OpenVPN Community and WireGuard runtimes so the client does not fail because OpenVPN is missing.
-- The Windows client verifies the runtime before connecting, runs connection work off the UI thread, records OpenVPN logs, and detects when the OpenVPN process exits.
-- The installer workflow validates downloaded runtime installers and verifies that the final installer was actually created.
-- `Best Server` selects the top-ranked currently available server.
+- **Parallel server-source racing:** the client queries all VPN Gate mirrors concurrently and immediately uses the first valid result.
+- **Longer streaming timeout:** large ~1 MB directory responses are no longer killed by a 7-second download limit.
+- **Persistent cache fallback:** a recent server list remains usable when VPN Gate is slow or temporarily unavailable.
+- **Smart ranking:** speed, latency, uptime and source score are combined to select better free relays.
+- **Fast Connect:** probes multiple top-ranked relays concurrently before attempting OpenVPN.
+- **Protocol fallback:** OpenVPN profiles can be retried using the original transport and TCP variants such as TCP/443 when supported.
+- **Automatic OpenVPN runtime:** the Windows client detects an existing OpenVPN installation and can install the official runtime when required.
+- **Non-blocking UI:** discovery, probing and connection work stay off the Tkinter UI thread.
+- **Better diagnostics:** connection failures and runtime state are written to the local Findupto log.
+- **API resilience:** the FastAPI service races upstream mirrors, caches successful results to disk, and serves the last good cache when upstream sources fail.
 
-The official OpenVPN Community project publishes Windows installers for Windows 10 and later. urlOpenVPN Community Downloadshttps://openvpn.net/community/
+## Important limitation
+
+Free public VPN relays are inherently unreliable and can be slow, overloaded or offline. Findupto improves selection and failover but cannot guarantee that a third-party relay will accept a connection or provide a specific speed.
 
 ## Windows client
 
-Run the installer as administrator. It installs:
+Run the installer as Administrator. The application uses official OpenVPN Community software for VPN Gate OpenVPN relays.
 
-- Findupto Free VPN
-- OpenVPN Community for OpenVPN servers
-- WireGuard for Windows for community WireGuard servers
+## Performance defaults
 
-The application can use either protocol based on the server record.
+The desktop client uses a 20-second per-source directory timeout and races three mirrors instead of trying curl, PowerShell and urllib sequentially for every mirror. A cached directory is shown immediately at startup while the live list refreshes in the background.
 
-## Performance
-
-The API caches the external VPN Gate directory for 5 minutes by default and performs the blocking upstream request outside the FastAPI event loop. The desktop client also keeps a short-lived local server cache, so opening the application does not require a fresh upstream request every time.
+The API uses a 10-minute cache by default and a 30-second upstream read timeout.
 
 Environment variables:
 
-- `VPN_CACHE_TTL` — API cache lifetime in seconds; default `300`.
-- `VPN_FETCH_TIMEOUT` — API upstream timeout; default `8` seconds.
-- `FINDUPTO_API_URL` — desktop API endpoint override.
+- `VPN_CACHE_TTL` — API cache lifetime in seconds; default `600`.
+- `VPN_FETCH_TIMEOUT` — API upstream read timeout; default `30` seconds.
+- `VPN_CACHE_FILE` — persistent API cache path.
+- `FINDUPTO_API_KEY` — required for community-node registration and heartbeat endpoints.
 
 ## Development
 
@@ -52,18 +54,17 @@ pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/a
 
 ### Installer
 
-The GitHub Actions workflow builds the EXE, downloads the official OpenVPN Community and WireGuard Windows installers, validates them, and creates `Findupto-Free-VPN-Setup.exe` with Inno Setup.
+The GitHub Actions workflow builds the EXE, downloads an official OpenVPN Community MSI with source failover, validates it, and creates `Findupto-Free-VPN-Setup.exe` with Inno Setup.
 
 Push a `v*` tag to publish the installer as a GitHub Release.
 
 ## Security
 
-- Never commit private WireGuard keys.
-- Use HTTPS for API and configuration endpoints.
-- Treat public/community VPN nodes as untrusted exit points.
+- Treat public VPN nodes as untrusted exit points.
+- Never commit private VPN keys or credentials.
+- Use HTTPS for API and configuration endpoints where available.
 - Do not log user traffic.
 - Keep node registration authenticated in production.
-- Prefer short-lived WireGuard client configurations.
 
 ## License
 
