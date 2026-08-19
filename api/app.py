@@ -10,16 +10,17 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-APP_VERSION = "3.0.0"
-CACHE_TTL = max(30, int(os.getenv("VPN_CACHE_TTL", "600")))
-FETCH_TIMEOUT = max(5, int(os.getenv("VPN_FETCH_TIMEOUT", "30")))
+APP_VERSION = "4.0.0"
+CACHE_TTL = max(30, int(os.getenv("VPN_CACHE_TTL", "300")))
+FETCH_TIMEOUT = max(4, int(os.getenv("VPN_FETCH_TIMEOUT", "9")))
+STALE_MAX_AGE = max(3600, int(os.getenv("VPN_STALE_MAX_AGE", str(7 * 86400))))
 CACHE_FILE = Path(os.getenv("VPN_CACHE_FILE", "/tmp/findupto-vpn-cache.json"))
 API_KEY = os.getenv("FINDUPTO_API_KEY", "")
-SOURCES = [
+SOURCES = (
     "https://www.vpngate.net/api/iphone/",
     "https://download.vpngate.jp/api/iphone/",
     "http://www.vpngate.net/api/iphone/",
-]
+)
 
 app = FastAPI(title="Findupto Free VPN Directory", version=APP_VERSION)
 
@@ -54,6 +55,7 @@ class PublicServer(BaseModel):
 nodes: dict[str, Node] = {}
 _cache: tuple[float, list[PublicServer]] = (0, [])
 _lock = asyncio.Lock()
+_refresh_task: asyncio.Task | None = None
 
 
 def require_api_key(x_api_key: str = Header(default="")):
@@ -68,7 +70,7 @@ def number(value: str | None, default: float | None = None) -> float | None:
         return default
 
 
-def parse_csv(payload: bytes, limit: int = 150) -> list[PublicServer]:
+def parse_csv(payload: bytes, limit: int = 160) -> list[PublicServer]:
     text = payload.decode("utf-8-sig", errors="replace")
     lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
     header = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
@@ -79,19 +81,19 @@ def parse_csv(payload: bytes, limit: int = 150) -> list[PublicServer]:
     for row in reader:
         ip = (row.get("IP") or "").strip()
         country = (row.get("CountryLong") or row.get("CountryShort") or "").strip()
-        if not ip or not country:
+        config = (row.get("OpenVPN_ConfigData_Base64") or "").strip() or None
+        if not ip or not country or not config:
             continue
         ping = number(row.get("Ping"))
         speed = number(row.get("Speed"))
         speed_mbps = speed / 1_000_000 if speed is not None else None
         uptime = min(100.0, max(0.0, number(row.get("Uptime"), 0) or 0))
-        score_raw = number(row.get("Score"), 0) or 0
+        gate_score = number(row.get("Score"), 0) or 0
         if ping is not None and ping > 900:
             continue
         if speed_mbps is not None and speed_mbps < 0.5:
             continue
-        score = (speed_mbps or 0) * 2.5 - (ping if ping is not None else 250) * 0.25 + uptime * 0.2 + score_raw * 0.01
-        config = (row.get("OpenVPN_ConfigData_Base64") or "").strip() or None
+        score = (speed_mbps or 0) * 2.5 - (ping if ping is not None else 250) * 0.25 + uptime * 0.2 + gate_score * 0.01
         result.append(PublicServer(
             id=f"vpngate-{ip}-{row.get('HostName','').strip()}",
             country=country,
@@ -110,19 +112,20 @@ def parse_csv(payload: bytes, limit: int = 150) -> list[PublicServer]:
     return result[:limit]
 
 
-def read_disk_cache() -> list[PublicServer]:
+def read_disk_cache() -> tuple[list[PublicServer], float]:
     try:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        return [PublicServer.model_validate(x) for x in data.get("servers", [])]
+        stamp = float(data.get("time", 0))
+        return [PublicServer.model_validate(x) for x in data.get("servers", [])], stamp
     except Exception:
-        return []
+        return [], 0
 
 
 def write_disk_cache(servers: list[PublicServer]):
     try:
         CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = CACHE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"time": time.time(), "servers": [x.model_dump() for x in servers]}), encoding="utf-8")
+        tmp.write_text(json.dumps({"time": time.time(), "servers": [x.model_dump() for x in servers]}, separators=(",", ":")), encoding="utf-8")
         tmp.replace(CACHE_FILE)
     except OSError:
         pass
@@ -132,34 +135,72 @@ async def fetch_source(client: httpx.AsyncClient, url: str):
     try:
         r = await client.get(url)
         r.raise_for_status()
-        return await asyncio.to_thread(parse_csv, r.content, 150)
-    except (httpx.HTTPError, OSError, ValueError):
-        return None
+        servers = await asyncio.to_thread(parse_csv, r.content, 160)
+        return url, servers, None
+    except Exception as exc:
+        return url, [], str(exc)
+
+
+async def refresh_live() -> list[PublicServer]:
+    timeout = httpx.Timeout(FETCH_TIMEOUT, connect=3.5, read=FETCH_TIMEOUT, write=5.0, pool=3.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "Findupto-Free-VPN-API/4.0", "Accept": "text/plain,*/*", "Accept-Encoding": "gzip, deflate"}) as client:
+        tasks = [asyncio.create_task(fetch_source(client, url)) for url in SOURCES]
+        pending = set(tasks)
+        deadline = asyncio.get_running_loop().time() + FETCH_TIMEOUT
+        collected: list[PublicServer] = []
+        while pending and asyncio.get_running_loop().time() < deadline:
+            timeout_left = max(0.05, deadline - asyncio.get_running_loop().time())
+            done, pending = await asyncio.wait(pending, timeout=timeout_left, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    _, servers, _ = task.result()
+                    collected.extend(servers)
+                except Exception:
+                    pass
+            if collected:
+                break
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        merged = {x.id: x for x in collected}
+        result = sorted(merged.values(), key=lambda x: x.score, reverse=True)[:160]
+        if result:
+            write_disk_cache(result)
+        return result
 
 
 async def get_servers(limit: int = 100) -> list[PublicServer]:
-    global _cache
-    if _cache[1] and time.monotonic() - _cache[0] < CACHE_TTL:
+    global _cache, _refresh_task
+    now = time.monotonic()
+    if _cache[1] and now - _cache[0] < CACHE_TTL:
         return _cache[1][:limit]
+
     async with _lock:
-        if _cache[1] and time.monotonic() - _cache[0] < CACHE_TTL:
+        now = time.monotonic()
+        if _cache[1] and now - _cache[0] < CACHE_TTL:
             return _cache[1][:limit]
-        timeout = httpx.Timeout(FETCH_TIMEOUT, connect=5.0, read=FETCH_TIMEOUT, write=10.0, pool=5.0)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "Findupto-Free-VPN-API/3.0", "Accept": "text/plain,*/*"}) as client:
-            tasks = [asyncio.create_task(fetch_source(client, url)) for url in SOURCES]
-            for task in asyncio.as_completed(tasks):
-                servers = await task
-                if servers:
-                    _cache = (time.monotonic(), servers)
-                    write_disk_cache(servers)
-                    for other in tasks:
-                        if not other.done():
-                            other.cancel()
-                    return servers[:limit]
-        disk = read_disk_cache()
-        if disk:
-            _cache = (time.monotonic(), disk)
+        disk, stamp = read_disk_cache()
+        if disk and time.time() - stamp <= STALE_MAX_AGE:
+            _cache = (now, disk)
+            # Serve immediately from disk; refresh in the background.
+            if _refresh_task is None or _refresh_task.done():
+                _refresh_task = asyncio.create_task(refresh_live())
+                def done(task):
+                    global _cache
+                    try:
+                        result = task.result()
+                        if result:
+                            _cache = (time.monotonic(), result)
+                    except Exception:
+                        pass
+                _refresh_task.add_done_callback(done)
             return disk[:limit]
+
+        result = await refresh_live()
+        if result:
+            _cache = (time.monotonic(), result)
+            return result[:limit]
         return []
 
 
@@ -170,7 +211,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "community_nodes": len(nodes), "cached_servers": len(_cache[1])}
+    return {"status": "healthy", "community_nodes": len(nodes), "cached_servers": len(_cache[1]), "refreshing": bool(_refresh_task and not _refresh_task.done())}
 
 
 @app.get("/api/v1/nodes", response_model=List[Node])
