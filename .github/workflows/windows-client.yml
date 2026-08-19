@@ -33,7 +33,6 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer | Out-Null
-          $ProgressPreference = 'SilentlyContinue'
           $urls = @(
             'https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi',
             'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi',
@@ -43,12 +42,7 @@ jobs:
           foreach ($u in $urls) {
             Remove-Item $out -Force -ErrorAction SilentlyContinue
             try {
-              Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -TimeoutSec 20 -ErrorAction Stop
-              if ((Get-Item $out).Length -gt 4000000) { break }
-            } catch {}
-            Remove-Item $out -Force -ErrorAction SilentlyContinue
-            try {
-              curl.exe --fail --silent --show-error --location --connect-timeout 5 --max-time 30 -A 'Findupto-Free-VPN-Build' -o $out $u
+              curl.exe --fail --silent --show-error --location --connect-timeout 8 --max-time 90 -A 'Findupto-Free-VPN-Build/3.0' -o $out $u
               if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 4000000) { break }
             } catch {}
           }
@@ -64,7 +58,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Findupto-Free-VPN-Windows-2.2.0
+          name: Findupto-Free-VPN-Windows-3.0.0
           path: installer/dist/Findupto-Free-VPN-Setup.exe
 
       - name: Publish GitHub release on tag
