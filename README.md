@@ -1,68 +1,55 @@
-# Findupto Free VPN 3.0
+# Findupto Free VPN 4.0
 
-A Windows desktop VPN client and free-server directory focused on fast discovery, smart server ranking, cache-first startup, and automatic OpenVPN failover.
+A Windows desktop VPN client and free-server directory focused on **fast discovery, stale-cache availability, smart server ranking, and connection failover**.
 
-## What changed
+## What changed in 4.0
 
-- **Parallel server-source racing:** the client queries all VPN Gate mirrors concurrently and immediately uses the first valid result.
-- **Longer streaming timeout:** large ~1 MB directory responses are no longer killed by a 7-second download limit.
-- **Persistent cache fallback:** a recent server list remains usable when VPN Gate is slow or temporarily unavailable.
-- **Smart ranking:** speed, latency, uptime and source score are combined to select better free relays.
-- **Fast Connect:** probes multiple top-ranked relays concurrently before attempting OpenVPN.
-- **Protocol fallback:** OpenVPN profiles can be retried using the original transport and TCP variants such as TCP/443 when supported.
-- **Automatic OpenVPN runtime:** the Windows client detects an existing OpenVPN installation and can install the official runtime when required.
-- **Non-blocking UI:** discovery, probing and connection work stay off the Tkinter UI thread.
-- **Better diagnostics:** connection failures and runtime state are written to the local Findupto log.
-- **API resilience:** the FastAPI service races upstream mirrors, caches successful results to disk, and serves the last good cache when upstream sources fail.
-
-## Important limitation
-
-Free public VPN relays are inherently unreliable and can be slow, overloaded or offline. Findupto improves selection and failover but cannot guarantee that a third-party relay will accept a connection or provide a specific speed.
+- Fixed the refresh deadlock that could produce `3 (of 3) futures unfinished`.
+- Discovery no longer uses a `ThreadPoolExecutor` context manager that waits for timed-out mirrors.
+- VPN Gate mirrors race in parallel with a hard discovery deadline.
+- Optional `FINDUPTO_API_URL` is queried as another discovery method.
+- Gzip/deflate responses are accepted to reduce large CSV transfer time.
+- Fresh local cache is returned immediately.
+- Stale cache up to 7 days can keep the application usable while upstream sources are down.
+- Slow/broken sources are cancelled without blocking the UI.
+- Server lists from successful sources are merged and smart-ranked.
+- Existing OpenVPN connection engine keeps UDP first and supports TCP fallback variants.
+- Windows CI now packages `client/launcher.py`, which installs the resilient discovery layer without replacing the existing UI.
+- API serves stale disk cache immediately and refreshes upstream in the background.
 
 ## Windows client
 
-Run the installer as Administrator. The application uses official OpenVPN Community software for VPN Gate OpenVPN relays.
+The installer includes the Findupto client and installs official OpenVPN Community when required. The client uses public VPN Gate OpenVPN profiles and should treat every public VPN relay as an untrusted exit point.
 
-## Performance defaults
+## Discovery settings
 
-The desktop client uses a 20-second per-source directory timeout and races three mirrors instead of trying curl, PowerShell and urllib sequentially for every mirror. A cached directory is shown immediately at startup while the live list refreshes in the background.
+Optional environment variables:
 
-The API uses a 10-minute cache by default and a 30-second upstream read timeout.
+- `FINDUPTO_API_URL` — Findupto API base URL; when set it becomes an additional server source.
+- `VPN_LIVE_TIMEOUT` — client live-discovery deadline; default `9` seconds.
+- `VPN_STALE_MAX_AGE` — maximum cached-server age; default 7 days.
+- `VPN_CACHE_TTL` — API fresh-cache lifetime; default 300 seconds.
+- `VPN_FETCH_TIMEOUT` — API upstream timeout; default 9 seconds.
 
-Environment variables:
-
-- `VPN_CACHE_TTL` — API cache lifetime in seconds; default `600`.
-- `VPN_FETCH_TIMEOUT` — API upstream read timeout; default `30` seconds.
-- `VPN_CACHE_FILE` — persistent API cache path.
-- `FINDUPTO_API_KEY` — required for community-node registration and heartbeat endpoints.
-
-## Development
-
-### API
-
-```bash
-docker compose up --build
-```
-
-### Windows client
+## Build Windows client
 
 ```powershell
 pip install -r client/requirements.txt
 pip install pyinstaller
-pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/app.py
+pyinstaller --noconfirm --clean --onefile --windowed --paths client --name FinduptoVPN client/launcher.py
 ```
 
-### Installer
+Or run `build_windows.bat` on Windows. GitHub Actions performs the same resilient launcher build and creates the standalone Inno Setup installer.
 
-The GitHub Actions workflow builds the EXE, downloads an official OpenVPN Community MSI with source failover, validates it, and creates `Findupto-Free-VPN-Setup.exe` with Inno Setup.
+## Important limitation
 
-Push a `v*` tag to publish the installer as a GitHub Release.
+No free public VPN directory can guarantee that a relay is online, fast, private, or safe. Findupto can fail over between available relays, but it cannot manufacture a working server when every public relay is unreachable. A real always-on service requires controlled servers under your administration.
 
 ## Security
 
-- Treat public VPN nodes as untrusted exit points.
-- Never commit private VPN keys or credentials.
-- Use HTTPS for API and configuration endpoints where available.
+- Never commit private WireGuard keys.
+- Use HTTPS for API and configuration endpoints.
+- Treat public/community VPN nodes as untrusted exit points.
 - Do not log user traffic.
 - Keep node registration authenticated in production.
 
