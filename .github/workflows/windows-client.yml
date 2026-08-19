@@ -29,27 +29,30 @@ jobs:
       - name: Build desktop EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/app.py
 
-      - name: Download official OpenVPN runtime with fallback methods
+      - name: Download official OpenVPN runtime
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer | Out-Null
-          $ProgressPreference='SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-          function Get-Fallback($urls,$out) {
-            foreach ($u in $urls) {
-              Remove-Item $out -Force -ErrorAction SilentlyContinue
-              try { Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
-              Remove-Item $out -Force -ErrorAction SilentlyContinue
-              try { curl.exe --fail --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 90 -o $out $u; if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 100000) { return } } catch {}
-              Remove-Item $out -Force -ErrorAction SilentlyContinue
-              try { Start-BitsTransfer -Source $u -Destination $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
-            }
-            throw "All download methods failed for $out"
+          $ProgressPreference = 'SilentlyContinue'
+          $urls = @(
+            'https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi',
+            'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi',
+            'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi'
+          )
+          $out = Join-Path $PWD 'installer/openvpn-amd64.msi'
+          foreach ($u in $urls) {
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -TimeoutSec 20 -ErrorAction Stop
+              if ((Get-Item $out).Length -gt 4000000) { break }
+            } catch {}
+            Remove-Item $out -Force -ErrorAction SilentlyContinue
+            try {
+              curl.exe --fail --silent --show-error --location --connect-timeout 5 --max-time 30 -A 'Findupto-Free-VPN-Build' -o $out $u
+              if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 4000000) { break }
+            } catch {}
           }
-          Get-Fallback @('https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi') 'installer/openvpn-amd64.msi'
-
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress -y
+          if (!(Test-Path $out) -or (Get-Item $out).Length -le 4000000) { throw 'Could not download an official OpenVPN MSI.' }
 
       - name: Build standalone installer
         shell: pwsh
@@ -61,7 +64,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Findupto-Free-VPN-Windows
+          name: Findupto-Free-VPN-Windows-2.2.0
           path: installer/dist/Findupto-Free-VPN-Setup.exe
 
       - name: Publish GitHub release on tag
