@@ -10,7 +10,7 @@ from tkinter import messagebox, ttk
 import vpn_engine as engine
 
 APP = "Findupto VPN"
-VERSION = "10.0.0"
+VERSION = "11.0.0"
 
 
 class App(tk.Tk):
@@ -78,7 +78,7 @@ class App(tk.Tk):
     def _discover_worker(self):
         try:
             data = engine.discover(12)
-            self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates; tunnel verification is mandatory"))
+            self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates; full-tunnel verification is mandatory"))
         except Exception as exc:
             engine.log(f"DISCOVERY FATAL {type(exc).__name__}: {exc}")
             self.events.put(("error", None, f"Discovery failed: {exc}\n\n{engine.LOG}"))
@@ -98,10 +98,10 @@ class App(tk.Tk):
         if not self.servers:
             messagebox.showwarning(APP, "No servers available. Refresh first.")
             return
-        # VPN Gate is ranked by live ping/speed. Try the best 10 Gate relays,
-        # then VPNBook fallbacks. This keeps connection time bounded.
-        gate = [s for s in self.servers if s.get("kind") == "gate"][:10]
-        book = [s for s in self.servers if s.get("kind") == "book"][:4]
+        # Prefer the live VPN Gate ranking, then use VPNBook as a separate fallback.
+        # Do not hardcode IPs: both catalogs are volatile public infrastructure.
+        gate = [s for s in self.servers if s.get("kind") == "gate"][:15]
+        book = [s for s in self.servers if s.get("kind") == "book"][:10]
         self._connect(gate + book)
 
     def selected(self):
@@ -115,7 +115,7 @@ class App(tk.Tk):
         if self.busy:
             return
         self._set_busy(True)
-        self.status.set(f"Testing {len(candidates)} servers; connected means full-tunnel + public-IP verified...")
+        self.status.set(f"Testing {len(candidates)} live servers; success requires full-tunnel + public-IP verification...")
         threading.Thread(target=self._connect_worker, args=(candidates,), daemon=True).start()
 
     def _connect_worker(self, candidates):
@@ -156,7 +156,7 @@ class App(tk.Tk):
                 errors.append(message)
                 engine.log(message)
 
-        self.events.put(("error", None, "No candidate connected successfully.\n\n" + "\n".join(errors[:20]) +
+        self.events.put(("error", None, "No live candidate connected successfully.\n\n" + "\n".join(errors[:25]) +
                         f"\n\nDiagnostic log:\n{engine.LOG}\nOpenVPN logs:\n{engine.PROFILE_LOGS}"))
 
     def disconnect(self):
