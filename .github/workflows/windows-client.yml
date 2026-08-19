@@ -42,12 +42,7 @@ jobs:
           foreach ($u in $urls) {
             Remove-Item $out -Force -ErrorAction SilentlyContinue
             try {
-              Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -TimeoutSec 30 -ErrorAction Stop
-              if ((Get-Item $out).Length -gt 4000000) { break }
-            } catch {}
-            Remove-Item $out -Force -ErrorAction SilentlyContinue
-            try {
-              curl.exe --fail --silent --show-error --location --connect-timeout 8 --max-time 45 -A 'Findupto-Free-VPN-Build/4.0' -o $out $u
+              curl.exe --fail --silent --show-error --location --connect-timeout 8 --max-time 60 -A 'Findupto-Free-VPN-Build/5.0' -o $out $u
               if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 4000000) { break }
             } catch {}
           }
@@ -63,7 +58,7 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Findupto-Free-VPN-Windows-4.0.0
+          name: Findupto-Free-VPN-Windows-5.0.0
           path: installer/dist/Findupto-Free-VPN-Setup.exe
 
       - name: Publish GitHub release on tag
