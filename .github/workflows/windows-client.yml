@@ -29,16 +29,22 @@ jobs:
       - name: Build desktop EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/app.py
 
-      - name: Download official VPN runtimes
+      - name: Download official VPN runtimes with fallback methods
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer | Out-Null
-          $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          try { Invoke-WebRequest -UseBasicParsing -Uri 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' -OutFile 'installer/wireguard-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer/wireguard-amd64.msi' 'https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi' }
-          try { Invoke-WebRequest -UseBasicParsing -Uri 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' -OutFile 'installer/openvpn-amd64.msi' -ErrorAction Stop } catch { curl.exe --fail --location --retry 3 -o 'installer/openvpn-amd64.msi' 'https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi' }
-          if ((Get-Item 'installer/wireguard-amd64.msi').Length -lt 100000) { throw 'WireGuard MSI download is invalid' }
-          if ((Get-Item 'installer/openvpn-amd64.msi').Length -lt 1000000) { throw 'OpenVPN MSI download is invalid' }
+          $ProgressPreference='SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+          function Get-Fallback($urls,$out) {
+            foreach ($u in $urls) {
+              try { Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
+              try { curl.exe --fail --location --retry 4 --retry-all-errors --connect-timeout 10 -o $out $u; if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 100000) { return } } catch {}
+              try { Start-BitsTransfer -Source $u -Destination $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
+            }
+            throw "All download methods failed for $out"
+          }
+          Get-Fallback @('https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi') 'installer/wireguard-amd64.msi'
+          Get-Fallback @('https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.22-I001-amd64.msi') 'installer/openvpn-amd64.msi'
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
