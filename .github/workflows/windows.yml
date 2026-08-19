@@ -22,17 +22,39 @@ jobs:
         run: python -m compileall -q client tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+      - name: Prepare bundled OpenVPN runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://build.openvpn.net/downloads/releases/OpenVPN-2.7.6-I001-amd64.msi'
+          $msi = Join-Path $env:RUNNER_TEMP 'OpenVPN-2.7.6-I001-amd64.msi'
+          $stage = Join-Path $env:RUNNER_TEMP 'openvpn-stage'
+          $runtime = Join-Path $PWD 'client/runtime'
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $runtime -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage,$runtime | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList @('/a', $msi, '/qn', "TARGETDIR=$stage") -Wait -NoNewWindow
+          $exe = Get-ChildItem $stage -Recurse -Filter openvpn.exe | Select-Object -First 1
+          if (-not $exe) { throw 'Bundled OpenVPN extraction did not contain openvpn.exe' }
+          Copy-Item (Join-Path $exe.Directory.FullName '*') $runtime -Recurse -Force
+          Get-ChildItem $stage -Recurse -Include *.inf,*.cat,*.sys | ForEach-Object {
+            $target = Join-Path $runtime $_.Name
+            Copy-Item $_.FullName $target -Force
+          }
+          if (-not (Test-Path (Join-Path $runtime 'openvpn.exe'))) { throw 'runtime/openvpn.exe missing' }
+          & (Join-Path $runtime 'openvpn.exe') --version
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
-      - name: Build Windows executable
-        run: pyinstaller --clean --noconfirm --onefile --windowed --uac-admin --paths client --name FinduptoVPN client/app.py
+      - name: Build standalone Windows executable
+        run: pyinstaller --clean --noconfirm --onefile --windowed --uac-admin --paths client --add-data "client/runtime;runtime" --name FinduptoVPN client/app.py
       - name: Verify executable exists
         shell: pwsh
         run: |
           if (-not (Test-Path "dist/FinduptoVPN.exe")) { throw "Build did not produce dist/FinduptoVPN.exe" }
           Get-Item "dist/FinduptoVPN.exe" | Select-Object FullName,Length
-      - name: Upload EXE
+      - name: Upload standalone EXE
         uses: actions/upload-artifact@v4
         with:
-          name: FinduptoVPN-Windows
+          name: FinduptoVPN-Windows-Standalone
           path: dist/FinduptoVPN.exe
