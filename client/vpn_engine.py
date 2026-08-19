@@ -1,182 +1,442 @@
 from __future__ import annotations
-import base64,csv,gzip,html,io,json,os,re,shutil,ssl,subprocess,tempfile,threading,time,urllib.request,zipfile
+
+import base64
+import csv
+import gzip
+import html
+import io
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.request
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor,wait
-ROOT=Path(os.environ.get('LOCALAPPDATA',tempfile.gettempdir()))/'FinduptoVPN'
-LOG=ROOT/'diagnostic.log'; PROFILE_LOGS=ROOT/'openvpn-logs'; CACHE=ROOT/'servers.json'
-UA='FinduptoVPN/9.2.0'
-GATE_URLS=('https://www.vpngate.net/api/iphone/','https://download.vpngate.jp/api/iphone/')
-VPNBOOK_PAGE='https://www.vpnbook.com/freevpn/openvpn'
-VPNBOOK={'us16':('United States','US16'),'us178':('United States','US178'),'ca149':('Canada','CA149'),'ca196':('Canada','CA196'),'uk205':('United Kingdom','UK205'),'uk68':('United Kingdom','UK68'),'de20':('Germany','DE20'),'de220':('Germany','DE220'),'fr200':('France','FR200'),'fr2311':('France','FR2311')}
-_lock=threading.Lock()
-def log(msg:str)->None:
- ROOT.mkdir(parents=True,exist_ok=True)
- with _lock:
-  with LOG.open('a',encoding='utf-8') as f:f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
-def _curl()->str|None:
- for name in ('curl.exe','curl'):
-  p=shutil.which(name)
-  if p:return p
- return None
-def http_get(url:str,timeout:float=12,limit:int=10000000)->bytes:
- started=time.monotonic();log(f'HTTP START {url} timeout={timeout:.1f}s limit={limit}')
- curl=_curl()
- if curl:
-  cmd=[curl,'--fail','--silent','--show-error','--location','--compressed','--connect-timeout',str(max(2,int(timeout*.4))),'--max-time',str(max(3,int(timeout))),'-A',UA,url]
-  try:
-   cp=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout+2,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
-   if cp.returncode:raise RuntimeError(f'curl exit {cp.returncode}: {cp.stderr.decode("utf-8","replace")[-500:]}')
-   data=cp.stdout
-   if len(data)>limit:raise RuntimeError('response too large')
-   log(f'HTTP OK {url} bytes={len(data)} elapsed={time.monotonic()-started:.2f}s method=curl');return data
-  except Exception as e:log(f'HTTP CURL FAIL {url} error={type(e).__name__}: {e}')
- req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'*/*','Connection':'close'})
- try:
-  with urllib.request.urlopen(req,timeout=min(timeout,12),context=ssl.create_default_context()) as r:
-   data=r.read(limit+1)
-   if len(data)>limit:raise RuntimeError('response too large')
-   enc=(r.headers.get('Content-Encoding') or '').lower()
-   if 'gzip' in enc:data=gzip.decompress(data)
-   log(f'HTTP OK {url} bytes={len(data)} elapsed={time.monotonic()-started:.2f}s method=urllib');return data
- except Exception as e:log(f'HTTP FAIL {url} elapsed={time.monotonic()-started:.2f}s error={type(e).__name__}: {e}');raise
-def parse_gate(raw:bytes)->list[dict]:
- text=raw.decode('utf-8-sig','replace').replace('\r','');lines=text.split('\n');header=next((x for x in lines if x.startswith('#HostName,')),None)
- if not header:raise RuntimeError('VPN Gate CSV header missing')
- fields=next(csv.reader([header[1:]]));out=[]
- for line in lines:
-  if not line or line.startswith('#'):continue
-  try:row=next(csv.reader([line]))
-  except Exception:continue
-  if len(row)<len(fields):continue
-  d=dict(zip(fields,row));ip=(d.get('IP') or '').strip();host=(d.get('HostName') or '').strip();cfg=(d.get('OpenVPN_ConfigData_Base64') or '').strip()
-  if not ip or not host or not cfg:continue
-  try:ping=float(d.get('Ping') or 9999)
-  except Exception:ping=9999
-  try:speed=float(d.get('Speed') or 0)/1000000
-  except Exception:speed=0
-  try:uptime=float(d.get('Uptime') or 0)/86400
-  except Exception:uptime=0
-  try:score=float(d.get('Score') or 0)
-  except Exception:score=0
-  out.append({'id':f'gate:{ip}:{host}','ip':ip,'host':host,'country':d.get('CountryLong') or d.get('CountryShort') or 'Unknown','city':d.get('City') or 'Unknown','ping':ping,'speed':speed,'rank':speed*5+min(uptime,100)*.12+score*.01-min(ping,2000)*.28,'config':cfg,'source':'VPN Gate','kind':'gate'})
- return sorted(out,key=lambda s:s['rank'],reverse=True)
-def vpnbook_servers()->list[dict]:
- return [{'id':f'book:{sid}','sid':sid,'ip':f'{sid}.vpnbook.com','host':f'{sid}.vpnbook.com','country':c,'city':city,'ping':9999,'speed':0,'rank':-50,'source':'VPNBook','kind':'book','bundle':f'https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-{sid}.zip'} for sid,(c,city) in VPNBOOK.items()]
-def _cache_load()->list[dict]:
- try:
-  d=json.loads(CACHE.read_text(encoding='utf-8'));return d.get('servers',[]) if time.time()-float(d.get('time',0))<86400 else []
- except Exception:return []
-def _cache_save(servers:list[dict])->None:
- try:
-  ROOT.mkdir(parents=True,exist_ok=True);tmp=CACHE.with_suffix('.tmp');tmp.write_text(json.dumps({'time':time.time(),'servers':servers},separators=(',',':')),encoding='utf-8');tmp.replace(CACHE)
- except Exception as e:log(f'CACHE SAVE FAIL {type(e).__name__}: {e}')
-def discover(deadline:float=12)->list[dict]:
- start=time.monotonic();merged={s['id']:s for s in vpnbook_servers()}
- for s in _cache_load():merged[s.get('id',f"cache:{s.get('ip','')}")]=s
- log(f'DISCOVERY START cache={len(merged)}')
- ex=ThreadPoolExecutor(max_workers=2);futures=[ex.submit(http_get,u,min(deadline,10),8000000) for u in GATE_URLS]
- done,_=wait(futures,timeout=deadline+1)
- for fut in done:
-  try:
-   for s in parse_gate(fut.result()):merged[s['id']]=s
-   log('DISCOVERY GATE OK')
-  except Exception as e:log(f'DISCOVERY GATE FAIL {type(e).__name__}: {e}')
- ex.shutdown(wait=False,cancel_futures=True)
- data=sorted(merged.values(),key=lambda s:(s.get('rank',-999),-s.get('ping',9999)),reverse=True)[:180];_cache_save(data);log(f'DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-start:.2f}s');return data
-def openvpn_exe()->str|None:
- for p in (shutil.which('openvpn.exe'),shutil.which('openvpn'),r'C:\Program Files\OpenVPN\bin\openvpn.exe',r'C:\Program Files\OpenVPN\bin\openvpn-gui.exe'):
-  if p and os.path.isfile(p) and p.lower().endswith('openvpn.exe'):return p
- return None
-def _vpnbook_profiles(server:dict)->list[str]:
- raw=http_get(server['bundle'],15,5000000)
- if not raw.startswith(b'PK'):raise RuntimeError(f'VPNBook returned invalid bundle ({len(raw)} bytes)')
- with zipfile.ZipFile(io.BytesIO(raw)) as z:
-  names=[n for n in z.namelist() if n.lower().endswith('.ovpn')]
-  if not names:raise RuntimeError('VPNBook bundle contains no .ovpn profiles')
-  order=('tcp443','tcp80','udp53','udp25000');names=sorted(names,key=lambda n:next((i for i,k in enumerate(order) if k in n.lower()),99));log(f'VPNBOOK PROFILES server={server["host"]} profiles={len(names)} order={names}');return [z.read(n).decode('utf-8-sig','replace') for n in names]
-def _vpnbook_password()->str:
- raw=http_get(VPNBOOK_PAGE,12,10000000).decode('utf-8','replace');text=re.sub(r'\s+',' ',html.unescape(re.sub(r'<[^>]+>','\n',raw)));m=re.search(r'(?:VPN\s+)?Password\s*[:\-]?\s*([A-Za-z0-9]{6,24})',text,re.I)
- if not m:raise RuntimeError('VPNBook current password not found')
- value=m.group(1)
- if value.lower() in {'password','vpnbook','credentials','updated'}:raise RuntimeError('VPNBook password parser rejected invalid value')
- log(f'VPNBOOK AUTH username=vpnbook length={len(value)} fingerprint={value[:2]}***{value[-2:]}');return value
-def _profiles(server:dict)->tuple[list[str],str,str]:
- if server['kind']=='gate':return [base64.b64decode(server['config']+'===').decode('utf-8-sig','replace')],'vpn','vpn'
- return _vpnbook_profiles(server),'vpnbook',_vpnbook_password()
-def _prepare(profile:str,username:str,password:str,path:Path)->None:
- auth=path/'auth.txt';auth.write_text(username+'\n'+password+'\n',encoding='utf-8')
- lines=[]
- blocked=('auth-user-pass','route-gateway','route ','route-ipv6','redirect-gateway','route-nopull','pull-filter','register-dns')
- for line in profile.splitlines():
-  low=line.strip().lower()
-  if low.startswith(blocked):continue
-  lines.append(line)
- lines += ['redirect-gateway def1','route 0.0.0.0 128.0.0.0','route 128.0.0.0 128.0.0.0','route-ipv6 ::/1','route-ipv6 8000::/1','route-delay 2','route-metric 5','route-nopull']
- # route-nopull above would defeat the forced routes; remove it intentionally.
- lines=[x for x in lines if x.strip().lower()!='route-nopull']
- lines += ['auth-user-pass "'+str(auth)+'"','auth-nocache','resolv-retry infinite','connect-retry 2 3','connect-timeout 10','persist-key','persist-tun','verb 4','script-security 2']
- if os.name=='nt':lines += ['block-outside-dns']
- (path/'client.ovpn').write_text('\n'.join(lines)+'\n',encoding='utf-8')
-def _classify(text:str,code:int|None)->str:
- low=text.lower()
- for key,msg in (('auth_failed','authentication failed'),('options error','OpenVPN configuration error'),('tls error','TLS handshake failed'),('connection refused','connection refused'),('network is unreachable','network unreachable'),('cannot open tun','TUN/TAP adapter unavailable'),('all tap-windows adapters','TUN/TAP adapter unavailable'),('access is denied','administrator permission required'),('route addition failed','Windows route installation failed')):
-  if key in low:return msg
- return f'OpenVPN exited with code {code}' if code is not None else 'connection timeout'
-def route_snapshot()->str:
- if os.name!='nt':return ''
- try:
-  cp=subprocess.run(['route','print','-4'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=5,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));text=cp.stdout
-  hits=[x.strip() for x in text.splitlines() if re.search(r'(^|\s)(0\.0\.0\.0|128\.0\.0\.0)\s+128\.0\.0\.0\s',x)]
-  return ' | '.join(hits[-4:])
- except Exception as e:log(f'ROUTE SNAPSHOT FAIL {type(e).__name__}: {e}');return ''
-def connect(server:dict,total_deadline:float=50):
- exe=openvpn_exe()
- if not exe:raise RuntimeError('OpenVPN Community is not installed. Install OpenVPN Community and retry.')
- started=time.monotonic();profiles,user,pwd=_profiles(server);PROFILE_LOGS.mkdir(parents=True,exist_ok=True);last=''
- for idx,profile in enumerate(profiles,1):
-  if time.monotonic()-started>=total_deadline:break
-  work=Path(tempfile.mkdtemp(prefix='findupto-vpn-'));conf=work/'client.ovpn';_prepare(profile,user,pwd,work);logfile=PROFILE_LOGS/f'{server["host"].replace(":","_")}-{int(time.time())}-v{idx}.log';p=None
-  try:
-   p=subprocess.Popen([exe,'--config',str(conf),'--log',str(logfile),'--log-append'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));log(f'OPENVPN START server={server["host"]} variant={idx}/{len(profiles)} pid={p.pid} log={logfile}');deadline=min(started+total_deadline,time.monotonic()+14)
-   while time.monotonic()<deadline:
-    text=logfile.read_text(encoding='utf-8',errors='replace') if logfile.exists() else ''
-    if 'Initialization Sequence Completed' in text:
-     snap=route_snapshot();log(f'OPENVPN INITIALIZED server={server["host"]} variant={idx} pid={p.pid} routes={snap or "NO_FULL_TUNNEL_ROUTES_DETECTED"}')
-     if os.name=='nt' and not snap:
-      last='OpenVPN connected but Windows full-tunnel routes were not installed';log(f'CONNECT REJECTED server={server["host"]} reason={last}');p.terminate();p.wait(timeout=3);raise RuntimeError(last)
-     return p,work,logfile
-    if p.poll() is not None:last=_classify(text,p.returncode);break
-    time.sleep(.25)
-   if p and p.poll() is None:last='connection timeout';p.terminate()
-   if p:
-    try:p.wait(timeout=3)
+
+ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FinduptoVPN"
+LOG = ROOT / "diagnostic.log"
+PROFILE_LOGS = ROOT / "openvpn-logs"
+CACHE = ROOT / "servers.json"
+UA = "FinduptoVPN/10.0"
+
+# These are official VPN Gate API mirrors. Server addresses are discovered live;
+# no stale public IP list is shipped in the application.
+GATE_URLS = (
+    "https://www.vpngate.net/api/iphone/",
+    "https://www.vpngate.net/api/iphone/",
+    "https://download.vpngate.jp/api/iphone/",
+)
+VPNBOOK_PAGE = "https://www.vpnbook.com/freevpn/openvpn"
+CACHE_TTL = 6 * 60 * 60
+_lock = threading.Lock()
+
+
+def log(msg: str) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+
+
+def _curl() -> str | None:
+    for name in ("curl.exe", "curl"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def http_get(url: str, timeout: float = 12, limit: int = 10_000_000) -> bytes:
+    started = time.monotonic()
+    curl = _curl()
+    if curl:
+        # Do not use --compressed: some Windows curl builds reject it even though
+        # the HTTP request itself is perfectly valid. urllib is the reliable fallback.
+        cmd = [
+            curl, "--fail", "--silent", "--show-error", "--location",
+            "--connect-timeout", str(max(2, int(timeout * 0.4))),
+            "--max-time", str(max(3, int(timeout))), "-A", UA, url,
+        ]
+        try:
+            cp = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout + 2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if cp.returncode:
+                raise RuntimeError(
+                    f"curl exit {cp.returncode}: {cp.stderr.decode('utf-8', 'replace')[-500:]}"
+                )
+            data = cp.stdout
+            if len(data) > limit:
+                raise RuntimeError("response too large")
+            log(f"HTTP OK method=curl url={url} bytes={len(data)} elapsed={time.monotonic()-started:.2f}s")
+            return data
+        except Exception as exc:
+            log(f"HTTP CURL FAIL url={url} error={type(exc).__name__}: {exc}")
+
+    request = urllib.request.Request(
+        url, headers={"User-Agent": UA, "Accept": "*/*", "Connection": "close"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=min(timeout, 15), context=ssl.create_default_context()) as response:
+            data = response.read(limit + 1)
+            if len(data) > limit:
+                raise RuntimeError("response too large")
+            encoding = (response.headers.get("Content-Encoding") or "").lower()
+            if "gzip" in encoding:
+                data = gzip.decompress(data)
+            log(f"HTTP OK method=urllib url={url} bytes={len(data)} elapsed={time.monotonic()-started:.2f}s")
+            return data
+    except Exception as exc:
+        log(f"HTTP FAIL url={url} error={type(exc).__name__}: {exc}")
+        raise
+
+
+def parse_gate(raw: bytes) -> list[dict]:
+    text = raw.decode("utf-8-sig", "replace").replace("\r", "")
+    lines = text.split("\n")
+    header_line = next((line for line in lines if line.startswith("#HostName,")), None)
+    if not header_line:
+        raise RuntimeError("VPN Gate CSV header missing")
+    fields = next(csv.reader([header_line[1:]]))
+    result: list[dict] = []
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        try:
+            row = next(csv.reader([line]))
+        except Exception:
+            continue
+        if len(row) < len(fields):
+            continue
+        item = dict(zip(fields, row))
+        ip = (item.get("IP") or "").strip()
+        host = (item.get("HostName") or "").strip()
+        config = (item.get("OpenVPN_ConfigData_Base64") or "").strip()
+        if not ip or not host or not config:
+            continue
+        try:
+            ping = float(item.get("Ping") or 9999)
+        except ValueError:
+            ping = 9999
+        try:
+            speed = float(item.get("Speed") or 0) / 1_000_000
+        except ValueError:
+            speed = 0
+        try:
+            uptime = float(item.get("Uptime") or 0) / 86400
+        except ValueError:
+            uptime = 0
+        try:
+            score = float(item.get("Score") or 0)
+        except ValueError:
+            score = 0
+        # Favor low latency and high throughput, while keeping score/uptime useful.
+        rank = speed * 8 + min(uptime, 100) * 0.08 + score * 0.01 - min(ping, 2000) * 0.35
+        result.append({
+            "id": f"gate:{ip}:{host}", "ip": ip, "host": host,
+            "country": item.get("CountryLong") or item.get("CountryShort") or "Unknown",
+            "city": item.get("City") or "Unknown", "ping": ping, "speed": speed,
+            "rank": rank, "config": config, "source": "VPN Gate", "kind": "gate",
+        })
+    return sorted(result, key=lambda server: server["rank"], reverse=True)
+
+
+def _vpnbook_catalog() -> list[dict]:
+    raw = http_get(VPNBOOK_PAGE, 12, 5_000_000).decode("utf-8", "replace")
+    found: dict[str, dict] = {}
+    for href, label in re.findall(r'''href=["']([^"']+)["'][^>]*>(.*?)<''', raw, re.I | re.S):
+        if not re.search(r"\.zip(?:[?#]|$)", href, re.I):
+            continue
+        url = html.unescape(href)
+        if not url.lower().startswith("http"):
+            url = "https://www.vpnbook.com" + (url if url.startswith("/") else "/" + url)
+        text = (url + " " + re.sub(r"<[^>]+>", " ", label)).lower()
+        match = re.search(r"vpnbook[-_]openvpn[-_]([a-z0-9-]+)\.zip", text, re.I)
+        if not match:
+            continue
+        sid = match.group(1).lower()
+        found[sid] = {
+            "id": f"book:{sid}", "sid": sid, "ip": f"{sid}.vpnbook.com",
+            "host": f"{sid}.vpnbook.com", "country": "VPNBook", "city": sid.upper(),
+            "ping": 9999, "speed": 0, "rank": -100, "bundle": url,
+            "source": "VPNBook", "kind": "book",
+        }
+    if found:
+        log(f"VPNBOOK CATALOG OK servers={len(found)}")
+    return list(found.values())
+
+
+def vpnbook_servers() -> list[dict]:
+    try:
+        return _vpnbook_catalog()
+    except Exception as exc:
+        log(f"VPNBOOK CATALOG FAIL error={type(exc).__name__}: {exc}")
+        return []
+
+
+def _cache_load() -> list[dict]:
+    try:
+        data = json.loads(CACHE.read_text(encoding="utf-8"))
+        if time.time() - float(data.get("time", 0)) < CACHE_TTL:
+            return data.get("servers", [])
     except Exception:
-     try:p.kill()
-     except Exception:pass
-   text=logfile.read_text(encoding='utf-8',errors='replace') if logfile.exists() else ''
-   if text:last=_classify(text,p.returncode if p else None)
-   log(f'OPENVPN ATTEMPT FAIL server={server["host"]} variant={idx} reason={last}')
-  except Exception as e:
-   last=str(e);log(f'OPENVPN ATTEMPT EXCEPTION server={server["host"]} variant={idx} error={type(e).__name__}: {e}')
-  finally:
-   if p and p.poll() is None:
-    try:p.kill()
-    except Exception:pass
-   if not (p and p.poll()==0 and last=='') : shutil.rmtree(work,ignore_errors=True)
- log(f'CONNECT FAIL server={server["host"]} reason={last or "all OpenVPN profiles failed"}');raise RuntimeError(last or 'all OpenVPN profiles failed; see OpenVPN logs')
-def public_ip(timeout:float=8)->str:
- for url in ('https://api.ipify.org','https://ifconfig.me/ip','https://icanhazip.com'):
-  try:
-   ip=http_get(url,timeout,256).decode('ascii','ignore').strip()
-   if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',ip) or ':' in ip:return ip
-  except Exception as e:log(f'PUBLIC IP FAIL {url}: {type(e).__name__}: {e}')
- raise RuntimeError('Unable to determine public IP')
-def verify_tunnel(previous_ip:str|None=None,timeout:float=8)->str:
- snap=route_snapshot();log(f'TUNNEL ROUTES {snap or "NO_FULL_TUNNEL_ROUTES_DETECTED"}')
- if os.name=='nt' and not snap:raise RuntimeError('VPN process connected, but Windows full-tunnel routes are missing')
- ip=public_ip(timeout)
- if previous_ip and ip==previous_ip:
-  log(f'TUNNEL REJECTED public_ip={ip} previous_ip={previous_ip} reason=public IP did not change')
-  raise RuntimeError(f'VPN initialized but traffic is still using the previous public IP ({ip}); full-tunnel routing is not active')
- log(f'TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or "unknown"}')
- return ip
+        pass
+    return []
+
+
+def _cache_save(servers: list[dict]) -> None:
+    try:
+        ROOT.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"time": time.time(), "servers": servers}, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(CACHE)
+    except Exception as exc:
+        log(f"CACHE SAVE FAIL error={type(exc).__name__}: {exc}")
+
+
+def discover(deadline: float = 12) -> list[dict]:
+    started = time.monotonic()
+    merged = {server["id"]: server for server in _cache_load()}
+    log(f"DISCOVERY START cached={len(merged)}")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(http_get, url, min(deadline, 10), 8_000_000) for url in GATE_URLS]
+        for future in as_completed(futures, timeout=deadline + 2):
+            try:
+                for server in parse_gate(future.result()):
+                    merged[server["id"]] = server
+            except Exception as exc:
+                log(f"DISCOVERY GATE FAIL error={type(exc).__name__}: {exc}")
+
+    for server in vpnbook_servers():
+        merged[server["id"]] = server
+
+    data = sorted(
+        merged.values(),
+        key=lambda server: (server.get("rank", -999), -server.get("ping", 9999)),
+        reverse=True,
+    )[:200]
+    _cache_save(data)
+    log(f"DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-started:.2f}s")
+    return data
+
+
+def openvpn_exe() -> str | None:
+    candidates = (
+        shutil.which("openvpn.exe"), shutil.which("openvpn"),
+        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+    )
+    for path in candidates:
+        if path and os.path.isfile(path) and path.lower().endswith("openvpn.exe"):
+            return path
+    return None
+
+
+def _vpnbook_profiles(server: dict) -> list[str]:
+    raw = http_get(server["bundle"], 15, 8_000_000)
+    if not raw.startswith(b"PK"):
+        raise RuntimeError(f"VPNBook returned an invalid configuration bundle ({len(raw)} bytes)")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        names = [name for name in archive.namelist() if name.lower().endswith(".ovpn")]
+        if not names:
+            raise RuntimeError("VPNBook bundle contains no OpenVPN profiles")
+        order = ("tcp443", "tcp80", "udp53", "udp25000")
+        names.sort(key=lambda name: next((i for i, token in enumerate(order) if token in name.lower()), 99))
+        return [archive.read(name).decode("utf-8-sig", "replace") for name in names]
+
+
+def _vpnbook_password() -> str:
+    raw = http_get(VPNBOOK_PAGE, 12, 5_000_000).decode("utf-8", "replace")
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)))
+    match = re.search(r"\bPassword\s*[:\-]?\s*([A-Za-z0-9]{6,24})\b", text, re.I)
+    if not match:
+        raise RuntimeError("VPNBook current password was not found on its official credentials page")
+    value = match.group(1)
+    if value.lower() in {"password", "username", "updated", "vpnbook", "credentials", "service"}:
+        raise RuntimeError("VPNBook page did not expose a valid current password")
+    log(f"VPNBOOK AUTH source=official-page length={len(value)}")
+    return value
+
+
+def _profiles(server: dict) -> tuple[list[str], str, str]:
+    if server["kind"] == "gate":
+        try:
+            config = base64.b64decode(server["config"] + "===").decode("utf-8-sig", "replace")
+        except Exception as exc:
+            raise RuntimeError(f"VPN Gate configuration decode failed: {exc}") from exc
+        return [config], "vpn", "vpn"
+    return _vpnbook_profiles(server), "vpnbook", _vpnbook_password()
+
+
+def _prepare(profile: str, username: str, password: str, work: Path) -> Path:
+    auth = work / "auth.txt"
+    auth.write_text(username + "\n" + password + "\n", encoding="utf-8")
+
+    # Keep provider transport/cipher/TLS directives intact. Only remove directives
+    # that would prevent the client from enforcing a full-tunnel browser route.
+    blocked_prefixes = (
+        "auth-user-pass", "redirect-gateway", "route ", "route-ipv6 ",
+        "route-nopull", "pull-filter", "register-dns",
+    )
+    lines = []
+    for line in profile.splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith(blocked_prefixes):
+            continue
+        lines.append(line)
+
+    lines.extend([
+        "redirect-gateway def1",
+        "route 0.0.0.0 128.0.0.0",
+        "route 128.0.0.0 128.0.0.0",
+        "route-metric 5",
+        'auth-user-pass "' + str(auth) + '"',
+        "auth-nocache",
+        "resolv-retry infinite",
+        "connect-retry 2 3",
+        "connect-timeout 10",
+        "persist-key",
+        "persist-tun",
+        "verb 4",
+    ])
+    if os.name == "nt":
+        lines.append("block-outside-dns")
+
+    config = work / "client.ovpn"
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config
+
+
+def _classify(text: str, code: int | None) -> str:
+    low = text.lower()
+    patterns = (
+        ("auth_failed", "authentication failed"),
+        ("options error", "OpenVPN configuration error"),
+        ("tls error", "TLS handshake failed"),
+        ("connection refused", "connection refused"),
+        ("network is unreachable", "network unreachable"),
+        ("cannot open tun", "TUN/TAP adapter unavailable"),
+        ("all tap-windows adapters", "TUN/TAP adapter unavailable"),
+        ("access is denied", "administrator permission required"),
+        ("route addition failed", "Windows route installation failed"),
+    )
+    for key, message in patterns:
+        if key in low:
+            return message
+    return f"OpenVPN exited with code {code}" if code is not None else "connection timeout"
+
+
+def route_snapshot() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        cp = subprocess.run(
+            ["route", "print", "-4"], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        hits = [
+            line.strip() for line in cp.stdout.splitlines()
+            if re.search(r"(^|\s)(0\.0\.0\.0|128\.0\.0\.0)\s+128\.0\.0\.0\s", line)
+        ]
+        return " | ".join(hits[-4:])
+    except Exception as exc:
+        log(f"ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
+        return ""
+
+
+def connect(server: dict, total_deadline: float = 35):
+    exe = openvpn_exe()
+    if not exe:
+        raise RuntimeError("OpenVPN Community is not installed. Install OpenVPN Community and retry.")
+
+    started = time.monotonic()
+    profiles, username, password = _profiles(server)
+    PROFILE_LOGS.mkdir(parents=True, exist_ok=True)
+    last = ""
+
+    for index, profile in enumerate(profiles, 1):
+        if time.monotonic() - started >= total_deadline:
+            break
+        work = Path(tempfile.mkdtemp(prefix="findupto-vpn-"))
+        config = _prepare(profile, username, password, work)
+        logfile = PROFILE_LOGS / f"{server['host'].replace(':', '_')}-{int(time.time())}-v{index}.log"
+        process = None
+        try:
+            process = subprocess.Popen(
+                [exe, "--config", str(config), "--log", str(logfile), "--log-append"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            log(f"OPENVPN START server={server['host']} variant={index}/{len(profiles)} pid={process.pid} log={logfile}")
+            deadline = min(started + total_deadline, time.monotonic() + 11)
+            while time.monotonic() < deadline:
+                text = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
+                if "Initialization Sequence Completed" in text:
+                    snapshot = route_snapshot()
+                    if os.name == "nt" and not snapshot:
+                        last = "OpenVPN connected but full-tunnel Windows routes were not installed"
+                        process.terminate()
+                        process.wait(timeout=3)
+                        raise RuntimeError(last)
+                    log(f"OPENVPN INITIALIZED server={server['host']} variant={index} routes={snapshot or 'non-Windows'}")
+                    return process, work, logfile
+                if process.poll() is not None:
+                    last = _classify(text, process.returncode)
+                    break
+                time.sleep(0.2)
+
+            if process and process.poll() is None:
+                last = "connection timeout"
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    process.kill()
+            text = logfile.read_text(encoding="utf-8", errors="replace") if logfile.exists() else ""
+            if text:
+                last = _classify(text, process.returncode if process else None)
+            log(f"OPENVPN ATTEMPT FAIL server={server['host']} variant={index} reason={last}")
+        except Exception as exc:
+            last = str(exc)
+            log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} variant={index} error={type(exc).__name__}: {exc}")
+        finally:
+            if process and process.poll() is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            shutil.rmtree(work, ignore_errors=True)
+
+    raise RuntimeError(last or "all OpenVPN profiles failed; see OpenVPN logs")
+
+
+def public_ip(timeout: float = 8) -> str:
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            value = http_get(url, timeout, 256).decode("ascii", "ignore").strip()
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
+                return value
+        except Exception as exc:
+            log(f"PUBLIC IP FAIL url={url} error={type(exc).__name__}: {exc}")
+    raise RuntimeError("Unable to determine public IP")
+
+
+def verify_tunnel(previous_ip: str | None = None, timeout: float = 8) -> str:
+    snapshot = route_snapshot()
+    if os.name == "nt" and not snapshot:
+        raise RuntimeError("VPN process connected, but full-tunnel Windows routes are missing")
+    ip = public_ip(timeout)
+    if previous_ip and ip == previous_ip:
+        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
+    log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'}")
+    return ip
