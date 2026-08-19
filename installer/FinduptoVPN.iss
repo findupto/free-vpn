@@ -1,5 +1,5 @@
 #define MyAppName "Findupto Free VPN"
-#define MyAppVersion "2.2.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "Findupto"
 #define MyAppExeName "FinduptoVPN.exe"
 
