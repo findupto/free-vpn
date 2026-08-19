@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import standalone_engine as engine
+import runtime_bootstrap
 
 APP = "Findupto VPN"
 VERSION = engine.APP_VERSION
@@ -123,6 +124,8 @@ class App(tk.Tk):
                 return
             try:
                 self.events.put(("status", None, f"Trying {server['host']} ({server['source']})..."))
+                if not runtime_bootstrap.install_bundled_drivers():
+                    engine.log("RUNTIME DRIVER bootstrap: no bundled INF installed; continuing with existing driver")
                 process, tmp, logfile = engine.connect(server, 45)
                 try:
                     if process.poll() is not None:
