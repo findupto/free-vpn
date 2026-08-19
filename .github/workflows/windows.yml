@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-and-build:
     runs-on: windows-latest
@@ -13,14 +16,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Upgrade build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
       - name: Compile Python sources
         run: python -m compileall -q client tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+        run: python -m pip install --upgrade pyinstaller
       - name: Build Windows executable
         run: pyinstaller --clean --noconfirm --onefile --windowed --paths client --name FinduptoVPN client/app.py
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/FinduptoVPN.exe")) { throw "Build did not produce dist/FinduptoVPN.exe" }
+          Get-Item "dist/FinduptoVPN.exe" | Select-Object FullName,Length
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
