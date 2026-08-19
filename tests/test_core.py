@@ -1,12 +1,15 @@
 import base64
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from client.vpn_engine import _cache_load, _prepare, parse_gate, vpnbook_servers, vpnbook_servers_from_html
-from client import standalone_engine
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'client'))
+
+from client.vpn_engine import _cache_load, parse_gate, vpnbook_servers, vpnbook_servers_from_html
+import standalone_engine
 
 
 class CoreTests(unittest.TestCase):
