@@ -1,33 +1,33 @@
 # Findupto VPN
 
-A lightweight Windows desktop VPN client that discovers public OpenVPN profiles from live public catalogs, ranks candidates, connects through OpenVPN Community, and verifies that the system public IP actually changed.
+A Windows desktop VPN client that discovers live public OpenVPN servers, ranks them, tries the fastest candidates automatically, installs bundled VPN drivers when needed, and refuses to report success until the system is actually using the tunnel.
 
-## v12.0.0
+## v13.0.0
 
-This release focuses on the OpenVPN 2.7.x failures reported in the diagnostic logs:
+This release removes the old machine-level runtime dependency from the application path and hardens the exact failures shown in the diagnostic logs:
 
-- fixes generated OpenVPN Windows paths by writing forward-slash paths in `.ovpn` files;
-- removes obsolete `fast-io` and `persist-key` directives from generated profiles;
-- keeps OpenVPN 2.6+ DCO disabled for compatibility with public profiles;
-- preserves legacy cipher compatibility through `data-ciphers` / `data-ciphers-fallback`;
-- keeps compression only when the downloaded public profile explicitly requires it;
-- stops creating four permanent log files for every failed server;
-- retains only the latest failed OpenVPN log for troubleshooting;
-- removes stale/invalid cached server entries before reuse;
-- accepts VPNBook configuration bundles only when linked by the live official page;
-- keeps curl optional and falls back to Python `urllib` when the installed curl lacks features;
-- verifies full-tunnel Windows routes and public IP before reporting a connection as successful;
-- adds regression coverage for the Windows backslash configuration failure;
-- hardens Windows CI and executable packaging.
+- no curl dependency for discovery or public-IP checks;
+- standalone runtime layer with its own OpenVPN executable lookup;
+- CI packages the official OpenVPN 2.7.6 Windows runtime into the executable;
+- bundled driver INF packages are installed automatically when the elevated application starts a connection;
+- full-tunnel verification now requires BOTH Windows routes `0.0.0.0/1` and `128.0.0.0/1`;
+- route installation gets a startup delay and retries Windows route methods (`ipapi`, `service`, `adaptive`);
+- `show-net-up` is enabled for authoritative OpenVPN network diagnostics;
+- IPv6 is blocked while using IPv4-only public VPN profiles to prevent IPv6 bypass;
+- DNS outside the tunnel is blocked on Windows;
+- OpenVPN 2.6+ DCO is disabled for compatibility with public profiles, with legacy cipher negotiation retained;
+- the client tries more live candidates before giving up;
+- successful connections are verified with both route state and a changed public IP;
+- cached entries remain restricted to validated catalog formats;
+- regression tests now cover the two-half-route requirement and generated profile hardening.
 
 ## Requirements
 
-- Windows 10/11
-- OpenVPN Community installed and available at the normal OpenVPN path
-- Administrator permission may be required by Windows/OpenVPN to create the tunnel adapter and routes
-- Internet access for live server discovery
+- Windows 10/11 x64
+- Internet access
+- Administrator/UAC approval for the standalone executable
 
-The application does not bundle third-party VPN credentials or hard-code a VPNBook password. Public VPN catalogs are volatile and can disappear or reject connections at any time.
+The repository source does not commit third-party binaries. The GitHub Windows build downloads the official OpenVPN Community 2.7.6 runtime and packages it into `FinduptoVPN.exe`, so the released executable does not require a separate OpenVPN installation or curl installation.
 
 ## Run from source
 
@@ -35,22 +35,22 @@ The application does not bundle third-party VPN credentials or hard-code a VPNBo
 python client/app.py
 ```
 
-Run the tests with:
+Run tests:
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-## Runtime files
+A source checkout without the bundled runtime can still use an existing OpenVPN installation through `FINDUPTO_OPENVPN` or the normal OpenVPN Windows path.
 
-The application stores diagnostics under `%LOCALAPPDATA%\FinduptoVPN`:
+## Runtime diagnostics
 
-- `diagnostic.log` — application/network diagnostics
+Diagnostics are stored under `%LOCALAPPDATA%\FinduptoVPN`:
+
+- `diagnostic.log` — discovery, route, runtime and connection diagnostics
 - `servers.json` — short-lived validated discovery cache
-- `openvpn-logs\<server>-last-failure.log` — latest failed OpenVPN attempt only
+- `openvpn-logs\<server>-last-failure.log` — latest failed connection log
 
-Successful connection profiles remain temporary and are deleted when disconnected.
+## Tunnel success rule
 
-## Safety
-
-Only live-discovered public server entries are accepted. The client verifies the tunnel before declaring success and refuses to trust arbitrary cached entries.
+A connection is successful only when Windows has both full-tunnel `/1` routes and the public IP changes. An OpenVPN TLS connection by itself is never considered success.
