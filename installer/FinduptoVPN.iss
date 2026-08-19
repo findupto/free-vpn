@@ -1,5 +1,5 @@
 #define MyAppName "Findupto Free VPN"
-#define MyAppVersion "0.6.0"
+#define MyAppVersion "2.2.0"
 #define MyAppPublisher "Findupto"
 #define MyAppExeName "FinduptoVPN.exe"
 
@@ -23,7 +23,6 @@ DisableProgramGroupPage=yes
 
 [Files]
 Source: "..\dist\FinduptoVPN.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "wireguard-amd64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "openvpn-amd64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 [Icons]
@@ -31,7 +30,6 @@ Name: "{autodesktop}\Findupto Free VPN"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Findupto Free VPN"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
-Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\wireguard-amd64.msi"" /qn /norestart"; StatusMsg: "Installing WireGuard..."; Flags: waituntilterminated; Check: NeedWireGuard
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\openvpn-amd64.msi"" /qn /norestart"; StatusMsg: "Installing OpenVPN Community..."; Flags: waituntilterminated; Check: NeedOpenVPN
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Findupto Free VPN"; Flags: nowait postinstall skipifsilent; Check: RuntimeReady
 
@@ -42,25 +40,14 @@ begin
   if not FileExists(Result) then Result := ExpandConstant('{autopf32}\OpenVPN\bin\openvpn.exe');
 end;
 
-function WireGuardPath(): String;
-begin
-  Result := ExpandConstant('{autopf}\WireGuard\wireguard.exe');
-  if not FileExists(Result) then Result := ExpandConstant('{autopf32}\WireGuard\wireguard.exe');
-end;
-
 function NeedOpenVPN(): Boolean;
 begin
   Result := not FileExists(OpenVPNPath());
 end;
 
-function NeedWireGuard(): Boolean;
-begin
-  Result := not FileExists(WireGuardPath());
-end;
-
 function RuntimeReady(): Boolean;
 begin
-  Result := FileExists(OpenVPNPath()) and FileExists(WireGuardPath());
+  Result := FileExists(OpenVPNPath());
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -70,9 +57,7 @@ begin
   if not FileExists(ExpandConstant('{src}\..\dist\FinduptoVPN.exe')) then
     Result := 'FinduptoVPN.exe was not found. Build the client EXE first.'
   else if not FileExists(ExpandConstant('{src}\openvpn-amd64.msi')) then
-    Result := 'OpenVPN MSI is missing. Run build_windows.bat or GitHub Actions first.'
-  else if not FileExists(ExpandConstant('{src}\wireguard-amd64.msi')) then
-    Result := 'WireGuard MSI is missing. Run build_windows.bat or GitHub Actions first.';
+    Result := 'OpenVPN MSI is missing. Run the Windows build first.';
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -82,7 +67,7 @@ begin
   begin
     if not RuntimeReady() then
     begin
-      MsgBox('VPN runtimes could not be verified. Reboot Windows if a driver installation was pending, then run this installer again as Administrator.', mbError, MB_OK);
+      MsgBox('OpenVPN could not be verified. Reboot Windows if a driver installation was pending, then run this installer again as Administrator.', mbError, MB_OK);
       Result := False;
     end;
   end;
