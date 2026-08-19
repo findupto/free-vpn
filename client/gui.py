@@ -125,7 +125,20 @@ class App(tk.Tk):
                 self.events.put(("status", None, f"Trying {server['host']} ({server['source']})..."))
                 process, tmp, logfile = engine.connect(server, 35)
                 try:
-                    ip = engine.verify_tunnel(baseline, 8)
+                    # OpenVPN's own initialization message plus a changed public IP are
+                    # the authoritative connectivity checks. Route inspection is useful
+                    # diagnostics, but Windows can transiently hide the route table from
+                    # a second subprocess even while the tunnel is already carrying traffic.
+                    if process.poll() is not None:
+                        raise RuntimeError("OpenVPN exited immediately after initialization")
+                    snapshot = engine.route_snapshot()
+                    ip = engine.public_ip(8)
+                    if baseline and ip == baseline:
+                        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
+                    if not snapshot:
+                        engine.log(f"POST-CONNECT ROUTE CHECK advisory server={server['host']} route_snapshot=unavailable; public_ip_changed={baseline != ip if baseline else 'unknown'}")
+                    else:
+                        engine.log(f"POST-CONNECT ROUTE CHECK server={server['host']} routes={snapshot}")
                 except Exception as verify_exc:
                     engine.log(f"POST-CONNECT VERIFICATION FAIL server={server['host']} error={type(verify_exc).__name__}: {verify_exc}")
                     try:
