@@ -1,7 +1,7 @@
 from __future__
 import base64,csv,gzip,html,io,json,os,re,shutil,ssl,subprocess,tempfile,threading,time,urllib.request,zipfile
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor,as_completed
+from concurrent.futures import ThreadPoolExecutor,wait
 ROOT=Path(os.environ.get('LOCALAPPDATA',tempfile.gettempdir()))/'FinduptoVPN'
 LOG=ROOT/'diagnostic.log'; PROFILE_LOGS=ROOT/'openvpn-logs'; CACHE=ROOT/'servers.json'
 UA='FinduptoVPN/9.0.0'
@@ -76,7 +76,8 @@ def discover(deadline:float=12)->list[dict]:
  log(f'DISCOVERY START cache={len(merged)}')
  with ThreadPoolExecutor(max_workers=2) as ex:
   futures=[ex.submit(http_get,u,min(deadline,10),8000000) for u in GATE_URLS]
-  for fut in as_completed(futures,timeout=deadline+1):
+  done,_=wait(futures,timeout=deadline+1)
+  for fut in done:
    try:
     for s in parse_gate(fut.result()):merged[s['id']]=s
     log('DISCOVERY GATE OK')
