@@ -55,6 +55,16 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn('route-nopull', text)
             self.assertNotIn('auth-user-pass\n', text)
 
+    def test_prepare_uses_forward_slashes_for_windows_auth_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _prepare('client\nremote 1.2.3.4 443 tcp\n', 'vpn', 'vpn', Path(directory), (2, 7, 5))
+            text = config.read_text(encoding='utf-8')
+            auth_line = next(line for line in text.splitlines() if line.startswith('auth-user-pass '))
+            self.assertIn('/', auth_line)
+            self.assertNotIn('\\', auth_line)
+            self.assertNotIn('fast-io', text.lower())
+            self.assertNotIn('persist-key', text.lower())
+
     def test_prepare_adds_legacy_cipher_compatibility(self):
         with tempfile.TemporaryDirectory() as directory:
             config = _prepare(
