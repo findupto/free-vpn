@@ -6,16 +6,20 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  test-and-build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Compile Python sources
+        run: python -m compileall -q client tests
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller
-      - name: Build
+      - name: Build Windows executable
         run: pyinstaller --clean --noconfirm --onefile --windowed --paths client --name FinduptoVPN client/launcher.py
       - name: Upload EXE
         uses: actions/upload-artifact@v4
