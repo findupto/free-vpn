@@ -20,7 +20,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-APP_VERSION = "12.0.0"
+APP_VERSION = "12.0.1"
 ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FinduptoVPN"
 LOG = ROOT / "diagnostic.log"
 PROFILE_LOGS = ROOT / "openvpn-logs"
@@ -49,22 +49,12 @@ def _curl() -> str | None:
     return None
 
 
-def _curl_supports_compressed(curl: str) -> bool:
-    try:
-        cp = subprocess.run([curl, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return "--compressed" in cp.stdout
-    except Exception:
-        return False
-
-
 def http_get(url: str, timeout: float = 12, limit: int = 10_000_000) -> bytes:
+    """Fetch without --compressed: some Windows curl builds advertise curl but do not implement it."""
     started = time.monotonic()
     curl = _curl()
     if curl:
-        cmd = [curl, "--fail", "--silent", "--show-error", "--location", "--connect-timeout", str(max(2, int(timeout * 0.4))), "--max-time", str(max(3, int(timeout))), "-A", UA]
-        if _curl_supports_compressed(curl):
-            cmd.append("--compressed")
-        cmd.append(url)
+        cmd = [curl, "--fail", "--silent", "--show-error", "--location", "--connect-timeout", str(max(2, int(timeout * 0.4))), "--max-time", str(max(3, int(timeout))), "-A", UA, url]
         try:
             cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout + 2, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if cp.returncode:
@@ -400,7 +390,7 @@ def connect(server: dict, total_deadline: float = 35):
         try:
             config = _prepare(profile, username, password, work, version)
             logfile = work / "openvpn.log"
-            process = subprocess.Popen([exe, "--config", str(config), "--log", str(logfile), "--log-append"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            process = subprocess.Popen([exe, "--config", str(config), "--log", str(logfile)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             log(f"OPENVPN START server={server['host']} profile={index}/{len(profiles)} pid={process.pid}")
             deadline = min(started + total_deadline, time.monotonic() + 12)
             while time.monotonic() < deadline:
