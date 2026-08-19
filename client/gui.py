@@ -3,7 +3,7 @@ import os,queue,shutil,threading
 import tkinter as tk
 from tkinter import messagebox,ttk
 import vpn_engine as engine
-APP='Findupto VPN';VERSION='9.0.0'
+APP='Findupto VPN';VERSION='9.1.0'
 class App(tk.Tk):
  def __init__(self):
   super().__init__();self.title(f'{APP} {VERSION}');self.geometry('1120x700');self.minsize(900,560);self.events=queue.Queue();self.servers=[];self.process=None;self.tmp=None;self.current_log=None;self.busy=False;self._build();self.after(100,self._pump);self.refresh()
@@ -29,7 +29,6 @@ class App(tk.Tk):
    ping='-' if s.get('ping',9999)>=9999 else f"{s['ping']:.0f} ms";speed='-' if not s.get('speed') else f"{s['speed']:.1f} Mbps";self.tree.insert('','end',iid=str(i),values=(s.get('country',''),s.get('city',''),s.get('host',''),ping,speed,s.get('source','')))
  def best(self):
   if not self.servers:messagebox.showwarning(APP,'No candidates. Refresh first.');return
-  # Always include multiple providers; never let the top VPN Gate rows crowd out VPNBook failover.
   gate=[s for s in self.servers if s.get('kind')=='gate'][:8];book=[s for s in self.servers if s.get('kind')=='book'];self._connect(gate+book)
  def selected(self):
   sel=self.tree.selection()
@@ -37,19 +36,21 @@ class App(tk.Tk):
   self._connect([self.servers[int(sel[0])]])
  def _connect(self,candidates):
   if self.busy:return
-  self._set_busy(True);self.status.set(f'Testing {len(candidates)} candidates; success requires OpenVPN initialization + public-IP verification...');threading.Thread(target=self._connect_worker,args=(candidates,),daemon=True).start()
+  self._set_busy(True);self.status.set(f'Testing {len(candidates)} candidates; success requires a changed public IP...');threading.Thread(target=self._connect_worker,args=(candidates,),daemon=True).start()
  def _connect_worker(self,candidates):
   errors=[]
+  try:baseline=engine.public_ip(6);engine.log(f'CONNECT BASELINE public_ip={baseline}')
+  except Exception as exc:baseline=None;engine.log(f'CONNECT BASELINE unavailable: {type(exc).__name__}: {exc}')
   for server in candidates:
    if self.process is not None:return
    try:
     self.events.put(('status',None,f"Trying {server['host']} ({server['source']})..."));process,tmp,logfile=engine.connect(server,50)
-    try:ip=engine.verify_tunnel(8)
+    try:ip=engine.verify_tunnel(baseline,8)
     except Exception:
      try:process.terminate()
      except Exception:pass
      shutil.rmtree(tmp,ignore_errors=True);raise
-    self.process,self.tmp,self.current_log=process,tmp,logfile;self.events.put(('connected',None,f"CONNECTED — {server['host']} — public IP {ip}"));return
+    self.process,self.tmp,self.current_log=process,tmp,logfile;self.events.put(('connected',None,f"CONNECTED — {server['host']} — verified public IP {ip}"));return
    except Exception as exc:
     msg=f"{server['host']}: {exc}";errors.append(msg);engine.log(msg)
   self.events.put(('error',None,'No candidate connected successfully.\n\n'+'\n'.join(errors[:20])+f'\n\nDiagnostic log:\n{engine.LOG}\nOpenVPN logs:\n{engine.PROFILE_LOGS}'))
