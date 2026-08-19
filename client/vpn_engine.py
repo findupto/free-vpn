@@ -4,10 +4,10 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor,wait
 ROOT=Path(os.environ.get('LOCALAPPDATA',tempfile.gettempdir()))/'FinduptoVPN'
 LOG=ROOT/'diagnostic.log'; PROFILE_LOGS=ROOT/'openvpn-logs'; CACHE=ROOT/'servers.json'
-UA='FinduptoVPN/9.1.0'
+UA='FinduptoVPN/9.2.0'
 GATE_URLS=('https://www.vpngate.net/api/iphone/','https://download.vpngate.jp/api/iphone/')
 VPNBOOK_PAGE='https://www.vpnbook.com/freevpn/openvpn'
-VPNBOOK={'us16':('United States','US16'),'us178':('United States','US178'),'ca149':('Canada','CA149'),'ca196':('Canada','CA196'),'uk205':('United Kingdom','UK205'),'uk68':('United Kingdom','UK68'),'de20':('Germany','DE20'),'de220':('Germany','DE220'),'fr200':('France','FR200'),'fr2311':('France','FR231')}
+VPNBOOK={'us16':('United States','US16'),'us178':('United States','US178'),'ca149':('Canada','CA149'),'ca196':('Canada','CA196'),'uk205':('United Kingdom','UK205'),'uk68':('United Kingdom','UK68'),'de20':('Germany','DE20'),'de220':('Germany','DE220'),'fr200':('France','FR200'),'fr2311':('France','FR2311')}
 _lock=threading.Lock()
 def log(msg:str)->None:
  ROOT.mkdir(parents=True,exist_ok=True)
@@ -84,7 +84,7 @@ def discover(deadline:float=12)->list[dict]:
  ex.shutdown(wait=False,cancel_futures=True)
  data=sorted(merged.values(),key=lambda s:(s.get('rank',-999),-s.get('ping',9999)),reverse=True)[:180];_cache_save(data);log(f'DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-start:.2f}s');return data
 def openvpn_exe()->str|None:
- for p in (shutil.which('openvpn.exe'),shutil.which('openvpn'),r'C:\Program Files\OpenVPN\bin\openvpn.exe'):
+ for p in (shutil.which('openvpn.exe'),shutil.which('openvpn'),r'C:\Program Files\OpenVPN\bin\openvpn.exe',r'C:\Program Files\OpenVPN\bin\openvpn-gui.exe'):
   if p and os.path.isfile(p) and p.lower().endswith('openvpn.exe'):return p
  return None
 def _vpnbook_profiles(server:dict)->list[str]:
@@ -106,21 +106,29 @@ def _profiles(server:dict)->tuple[list[str],str,str]:
 def _prepare(profile:str,username:str,password:str,path:Path)->None:
  auth=path/'auth.txt';auth.write_text(username+'\n'+password+'\n',encoding='utf-8')
  lines=[]
+ blocked=('auth-user-pass','route-gateway','route ','route-ipv6','redirect-gateway','route-nopull','pull-filter','register-dns')
  for line in profile.splitlines():
   low=line.strip().lower()
-  if low.startswith('auth-user-pass') or low.startswith('route-gateway') or low.startswith('route '):continue
+  if low.startswith(blocked):continue
   lines.append(line)
- # Force a full-tunnel IPv4 route. Some public profiles omit redirect-gateway,
- # which makes OpenVPN report CONNECTED while normal browser traffic still uses ISP.
- lines += ['redirect-gateway def1','route-delay 2','route-metric 5','auth-user-pass "'+str(auth)+'"','auth-nocache','resolv-retry infinite','connect-retry 2 3','connect-timeout 10','persist-key','persist-tun','verb 4']
- # Prefer the VPN DNS servers when the profile does not already define DNS handling.
- if not any(x.strip().lower().startswith('dhcp-option dns') for x in lines):lines += ['dhcp-option DNS 1.1.1.1','dhcp-option DNS 8.8.8.8']
+ lines += ['redirect-gateway def1','route 0.0.0.0 128.0.0.0','route 128.0.0.0 128.0.0.0','route-ipv6 ::/1','route-ipv6 8000::/1','route-delay 2','route-metric 5','route-nopull']
+ # route-nopull above would defeat the forced routes; remove it intentionally.
+ lines=[x for x in lines if x.strip().lower()!='route-nopull']
+ lines += ['auth-user-pass "'+str(auth)+'"','auth-nocache','resolv-retry infinite','connect-retry 2 3','connect-timeout 10','persist-key','persist-tun','verb 4','script-security 2']
+ if os.name=='nt':lines += ['block-outside-dns']
  (path/'client.ovpn').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 def _classify(text:str,code:int|None)->str:
  low=text.lower()
- for key,msg in (('auth_failed','authentication failed'),('options error','OpenVPN configuration error'),('tls error','TLS handshake failed'),('connection refused','connection refused'),('network is unreachable','network unreachable'),('cannot open tun','TUN/TAP adapter unavailable'),('all tap-windows adapters','TUN/TAP adapter unavailable'),('access is denied','administrator permission required')):
+ for key,msg in (('auth_failed','authentication failed'),('options error','OpenVPN configuration error'),('tls error','TLS handshake failed'),('connection refused','connection refused'),('network is unreachable','network unreachable'),('cannot open tun','TUN/TAP adapter unavailable'),('all tap-windows adapters','TUN/TAP adapter unavailable'),('access is denied','administrator permission required'),('route addition failed','Windows route installation failed')):
   if key in low:return msg
  return f'OpenVPN exited with code {code}' if code is not None else 'connection timeout'
+def route_snapshot()->str:
+ if os.name!='nt':return ''
+ try:
+  cp=subprocess.run(['route','print','-4'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=5,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));text=cp.stdout
+  hits=[x.strip() for x in text.splitlines() if re.search(r'(^|\s)(0\.0\.0\.0|128\.0\.0\.0)\s+128\.0\.0\.0\s',x)]
+  return ' | '.join(hits[-4:])
+ except Exception as e:log(f'ROUTE SNAPSHOT FAIL {type(e).__name__}: {e}');return ''
 def connect(server:dict,total_deadline:float=50):
  exe=openvpn_exe()
  if not exe:raise RuntimeError('OpenVPN Community is not installed. Install OpenVPN Community and retry.')
@@ -132,7 +140,11 @@ def connect(server:dict,total_deadline:float=50):
    p=subprocess.Popen([exe,'--config',str(conf),'--log',str(logfile),'--log-append'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));log(f'OPENVPN START server={server["host"]} variant={idx}/{len(profiles)} pid={p.pid} log={logfile}');deadline=min(started+total_deadline,time.monotonic()+14)
    while time.monotonic()<deadline:
     text=logfile.read_text(encoding='utf-8',errors='replace') if logfile.exists() else ''
-    if 'Initialization Sequence Completed' in text:log(f'OPENVPN INITIALIZED server={server["host"]} variant={idx} pid={p.pid}');return p,work,logfile
+    if 'Initialization Sequence Completed' in text:
+     snap=route_snapshot();log(f'OPENVPN INITIALIZED server={server["host"]} variant={idx} pid={p.pid} routes={snap or "NO_FULL_TUNNEL_ROUTES_DETECTED"}')
+     if os.name=='nt' and not snap:
+      last='OpenVPN connected but Windows full-tunnel routes were not installed';log(f'CONNECT REJECTED server={server["host"]} reason={last}');p.terminate();p.wait(timeout=3);raise RuntimeError(last)
+     return p,work,logfile
     if p.poll() is not None:last=_classify(text,p.returncode);break
     time.sleep(.25)
    if p and p.poll() is None:last='connection timeout';p.terminate()
@@ -144,12 +156,13 @@ def connect(server:dict,total_deadline:float=50):
    text=logfile.read_text(encoding='utf-8',errors='replace') if logfile.exists() else ''
    if text:last=_classify(text,p.returncode if p else None)
    log(f'OPENVPN ATTEMPT FAIL server={server["host"]} variant={idx} reason={last}')
-  except Exception as e:last=f'{type(e).__name__}: {e}';log(f'OPENVPN ATTEMPT EXCEPTION server={server["host"]} variant={idx} error={last}')
+  except Exception as e:
+   last=str(e);log(f'OPENVPN ATTEMPT EXCEPTION server={server["host"]} variant={idx} error={type(e).__name__}: {e}')
   finally:
    if p and p.poll() is None:
     try:p.kill()
     except Exception:pass
-   shutil.rmtree(work,ignore_errors=True)
+   if not (p and p.poll()==0 and last=='') : shutil.rmtree(work,ignore_errors=True)
  log(f'CONNECT FAIL server={server["host"]} reason={last or "all OpenVPN profiles failed"}');raise RuntimeError(last or 'all OpenVPN profiles failed; see OpenVPN logs')
 def public_ip(timeout:float=8)->str:
  for url in ('https://api.ipify.org','https://ifconfig.me/ip','https://icanhazip.com'):
@@ -159,9 +172,11 @@ def public_ip(timeout:float=8)->str:
   except Exception as e:log(f'PUBLIC IP FAIL {url}: {type(e).__name__}: {e}')
  raise RuntimeError('Unable to determine public IP')
 def verify_tunnel(previous_ip:str|None=None,timeout:float=8)->str:
+ snap=route_snapshot();log(f'TUNNEL ROUTES {snap or "NO_FULL_TUNNEL_ROUTES_DETECTED"}')
+ if os.name=='nt' and not snap:raise RuntimeError('VPN process connected, but Windows full-tunnel routes are missing')
  ip=public_ip(timeout)
  if previous_ip and ip==previous_ip:
   log(f'TUNNEL REJECTED public_ip={ip} previous_ip={previous_ip} reason=public IP did not change')
-  raise RuntimeError(f'VPN initialized but traffic is still using the previous public IP ({ip}); full-tunnel route was not established')
+  raise RuntimeError(f'VPN initialized but traffic is still using the previous public IP ({ip}); full-tunnel routing is not active')
  log(f'TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or "unknown"}')
  return ip
