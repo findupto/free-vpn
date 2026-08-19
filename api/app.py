@@ -1,25 +1,33 @@
 import asyncio
 import csv
+import json
 import os
-import secrets
 import time
-from typing import Dict, List
+from pathlib import Path
+from typing import List
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Findupto Free VPN Directory", version="0.4.0")
-API_KEY = os.getenv("FINDUPTO_API_KEY", "change-me")
-VPN_GATE_CSV = "https://www.vpngate.net/api/iphone/"
-CACHE_TTL = max(15, int(os.getenv("VPN_CACHE_TTL", "300")))
-FETCH_TIMEOUT = max(3, int(os.getenv("VPN_FETCH_TIMEOUT", "8")))
+APP_VERSION = "3.0.0"
+CACHE_TTL = max(30, int(os.getenv("VPN_CACHE_TTL", "600")))
+FETCH_TIMEOUT = max(5, int(os.getenv("VPN_FETCH_TIMEOUT", "30")))
+CACHE_FILE = Path(os.getenv("VPN_CACHE_FILE", "/tmp/findupto-vpn-cache.json"))
+API_KEY = os.getenv("FINDUPTO_API_KEY", "")
+SOURCES = [
+    "https://www.vpngate.net/api/iphone/",
+    "https://download.vpngate.jp/api/iphone/",
+    "http://www.vpngate.net/api/iphone/",
+]
+
+app = FastAPI(title="Findupto Free VPN Directory", version=APP_VERSION)
 
 
 class Node(BaseModel):
     id: str = Field(min_length=3, max_length=80)
     country: str = Field(min_length=2, max_length=80)
-    city: str = Field(min_length=1, max_length=80)
+    city: str = Field(default="Unknown", max_length=80)
     endpoint: str = Field(min_length=3, max_length=255)
     public_key: str = Field(min_length=20, max_length=100)
     protocol: str = "wireguard"
@@ -39,92 +47,125 @@ class PublicServer(BaseModel):
     speed_mbps: float | None = None
     score: float
     source: str
+    config_b64: str | None = None
     config_url: str | None = None
 
 
-nodes: Dict[str, Node] = {}
+nodes: dict[str, Node] = {}
 _cache: tuple[float, list[PublicServer]] = (0, [])
-_cache_lock = asyncio.Lock()
+_lock = asyncio.Lock()
 
 
 def require_api_key(x_api_key: str = Header(default="")):
-    if not secrets.compare_digest(x_api_key, API_KEY):
+    if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
-def as_float(value: str | None):
+def number(value: str | None, default: float | None = None) -> float | None:
     try:
-        return float(value) if value not in (None, "") else None
+        return float(value) if value not in (None, "") else default
     except (TypeError, ValueError):
-        return None
+        return default
 
 
-def fetch_vpngate_servers(limit: int = 100) -> list[PublicServer]:
-    headers = {"User-Agent": "Findupto-Free-VPN/0.4"}
-    try:
-        with httpx.Client(timeout=httpx.Timeout(FETCH_TIMEOUT, connect=3), follow_redirects=True, headers=headers) as client:
-            response = client.get(VPN_GATE_CSV)
-            response.raise_for_status()
-            text = response.content.decode("utf-8-sig", errors="replace")
-    except (httpx.HTTPError, OSError):
-        return []
-
+def parse_csv(payload: bytes, limit: int = 150) -> list[PublicServer]:
+    text = payload.decode("utf-8-sig", errors="replace")
     lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-    header_index = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
-    if header_index is None:
-        return []
-
-    reader = csv.DictReader([lines[header_index][1:]] + [line for line in lines[header_index + 1:] if line.strip() and not line.startswith("#") and not line.startswith("*")])
-    rows: list[PublicServer] = []
+    header = next((i for i, line in enumerate(lines) if line.startswith("#HostName,")), None)
+    if header is None:
+        raise ValueError("VPN Gate CSV header not found")
+    reader = csv.DictReader([lines[header][1:]] + [x for x in lines[header + 1:] if x.strip() and not x.startswith(("#", "*"))])
+    result: list[PublicServer] = []
     for row in reader:
         ip = (row.get("IP") or "").strip()
         country = (row.get("CountryLong") or row.get("CountryShort") or "").strip()
         if not ip or not country:
             continue
-        ping = as_float(row.get("Ping"))
-        speed_bps = as_float(row.get("Speed"))
-        speed = speed_bps / 1_000_000 if speed_bps is not None else None
-        uptime = min(as_float(row.get("Uptime")) or 0, 100)
-        if ping is not None and ping > 500:
+        ping = number(row.get("Ping"))
+        speed = number(row.get("Speed"))
+        speed_mbps = speed / 1_000_000 if speed is not None else None
+        uptime = min(100.0, max(0.0, number(row.get("Uptime"), 0) or 0))
+        score_raw = number(row.get("Score"), 0) or 0
+        if ping is not None and ping > 900:
             continue
-        if speed is not None and speed < 1:
+        if speed_mbps is not None and speed_mbps < 0.5:
             continue
-        score = (speed or 0) * 2 - (ping or 250) * 0.35 + uptime * 0.15
-        rows.append(PublicServer(
-            id=f"vpngate-{ip}-{row.get('HostName', '')}",
+        score = (speed_mbps or 0) * 2.5 - (ping if ping is not None else 250) * 0.25 + uptime * 0.2 + score_raw * 0.01
+        config = (row.get("OpenVPN_ConfigData_Base64") or "").strip() or None
+        result.append(PublicServer(
+            id=f"vpngate-{ip}-{row.get('HostName','').strip()}",
             country=country,
             city=(row.get("City") or "Unknown").strip() or "Unknown",
             hostname=(row.get("HostName") or "").strip(),
             ip=ip,
             protocol="openvpn",
             ping_ms=ping,
-            speed_mbps=speed,
+            speed_mbps=round(speed_mbps, 2) if speed_mbps is not None else None,
             score=round(score, 2),
             source="VPN Gate",
+            config_b64=config,
             config_url=f"https://www.vpngate.net/common/openvpn_download.aspx?ip={ip}",
         ))
-    rows.sort(key=lambda item: item.score, reverse=True)
-    return rows[:limit]
+    result.sort(key=lambda x: x.score, reverse=True)
+    return result[:limit]
 
 
-async def get_vpngate_servers(limit: int = 100) -> list[PublicServer]:
+def read_disk_cache() -> list[PublicServer]:
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return [PublicServer.model_validate(x) for x in data.get("servers", [])]
+    except Exception:
+        return []
+
+
+def write_disk_cache(servers: list[PublicServer]):
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"time": time.time(), "servers": [x.model_dump() for x in servers]}), encoding="utf-8")
+        tmp.replace(CACHE_FILE)
+    except OSError:
+        pass
+
+
+async def fetch_source(client: httpx.AsyncClient, url: str):
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        return await asyncio.to_thread(parse_csv, r.content, 150)
+    except (httpx.HTTPError, OSError, ValueError):
+        return None
+
+
+async def get_servers(limit: int = 100) -> list[PublicServer]:
     global _cache
-    now = time.monotonic()
-    if _cache[1] and now - _cache[0] < CACHE_TTL:
+    if _cache[1] and time.monotonic() - _cache[0] < CACHE_TTL:
         return _cache[1][:limit]
-    async with _cache_lock:
-        now = time.monotonic()
-        if _cache[1] and now - _cache[0] < CACHE_TTL:
+    async with _lock:
+        if _cache[1] and time.monotonic() - _cache[0] < CACHE_TTL:
             return _cache[1][:limit]
-        servers = await asyncio.to_thread(fetch_vpngate_servers, 100)
-        if servers:
-            _cache = (time.monotonic(), servers)
-        return _cache[1][:limit]
+        timeout = httpx.Timeout(FETCH_TIMEOUT, connect=5.0, read=FETCH_TIMEOUT, write=10.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "Findupto-Free-VPN-API/3.0", "Accept": "text/plain,*/*"}) as client:
+            tasks = [asyncio.create_task(fetch_source(client, url)) for url in SOURCES]
+            for task in asyncio.as_completed(tasks):
+                servers = await task
+                if servers:
+                    _cache = (time.monotonic(), servers)
+                    write_disk_cache(servers)
+                    for other in tasks:
+                        if not other.done():
+                            other.cancel()
+                    return servers[:limit]
+        disk = read_disk_cache()
+        if disk:
+            _cache = (time.monotonic(), disk)
+            return disk[:limit]
+        return []
 
 
 @app.get("/")
 def root():
-    return {"name": "Findupto Free VPN", "status": "ok", "version": app.version}
+    return {"name": "Findupto Free VPN", "status": "ok", "version": APP_VERSION}
 
 
 @app.get("/health")
@@ -134,27 +175,26 @@ def health():
 
 @app.get("/api/v1/nodes", response_model=List[Node])
 def list_nodes(country: str | None = None):
-    now = time.time()
-    healthy = [n for n in nodes.values() if n.active and now - n.last_seen < 300]
+    cutoff = time.time() - 300
+    result = [n for n in nodes.values() if n.active and n.last_seen >= cutoff]
     if country:
-        healthy = [n for n in healthy if n.country.lower() == country.lower()]
-    healthy.sort(key=lambda n: (n.country.lower(), n.city.lower()))
-    return healthy
+        result = [n for n in result if n.country.casefold() == country.casefold()]
+    return sorted(result, key=lambda n: (n.country.casefold(), n.city.casefold()))
 
 
 @app.get("/api/v1/public/servers", response_model=List[PublicServer])
-async def public_servers(country: str | None = None, limit: int = Query(default=30, ge=1, le=100)):
-    servers = await get_vpngate_servers(100)
+async def public_servers(country: str | None = None, limit: int = Query(30, ge=1, le=100)):
+    servers = await get_servers(100)
     if country:
-        servers = [s for s in servers if s.country.lower() == country.lower()]
+        servers = [x for x in servers if x.country.casefold() == country.casefold()]
     return servers[:limit]
 
 
 @app.get("/api/v1/public/best", response_model=PublicServer | None)
 async def best_public_server(country: str | None = None):
-    servers = await get_vpngate_servers(100)
+    servers = await get_servers(100)
     if country:
-        servers = [s for s in servers if s.country.lower() == country.lower()]
+        servers = [x for x in servers if x.country.casefold() == country.casefold()]
     return servers[0] if servers else None
 
 
