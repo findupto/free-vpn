@@ -29,7 +29,7 @@ jobs:
       - name: Build desktop EXE
         run: pyinstaller --noconfirm --clean --onefile --windowed --name FinduptoVPN client/app.py
 
-      - name: Download official VPN runtimes with fallback methods
+      - name: Download official OpenVPN runtime with fallback methods
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force installer | Out-Null
@@ -37,14 +37,16 @@ jobs:
           [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
           function Get-Fallback($urls,$out) {
             foreach ($u in $urls) {
+              Remove-Item $out -Force -ErrorAction SilentlyContinue
               try { Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
-              try { curl.exe --fail --location --retry 4 --retry-all-errors --connect-timeout 10 -o $out $u; if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 100000) { return } } catch {}
+              Remove-Item $out -Force -ErrorAction SilentlyContinue
+              try { curl.exe --fail --location --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 90 -o $out $u; if ($LASTEXITCODE -eq 0 -and (Get-Item $out).Length -gt 100000) { return } } catch {}
+              Remove-Item $out -Force -ErrorAction SilentlyContinue
               try { Start-BitsTransfer -Source $u -Destination $out -ErrorAction Stop; if ((Get-Item $out).Length -gt 100000) { return } } catch {}
             }
             throw "All download methods failed for $out"
           }
-          Get-Fallback @('https://download.wireguard.com/windows-client/wireguard-amd64-1.0.1.msi') 'installer/wireguard-amd64.msi'
-          Get-Fallback @('https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.22-I001-amd64.msi') 'installer/openvpn-amd64.msi'
+          Get-Fallback @('https://build.openvpn.net/downloads/releases/latest/openvpn-latest-stable-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.5-I001-amd64.msi','https://swupdate.openvpn.org/community/releases/OpenVPN-2.7.4-I002-amd64.msi') 'installer/openvpn-amd64.msi'
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
