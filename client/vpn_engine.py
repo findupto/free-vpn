@@ -1,10 +1,10 @@
-from __future__
+from __future__ import annotations
 import base64,csv,gzip,html,io,json,os,re,shutil,ssl,subprocess,tempfile,threading,time,urllib.request,zipfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor,wait
 ROOT=Path(os.environ.get('LOCALAPPDATA',tempfile.gettempdir()))/'FinduptoVPN'
 LOG=ROOT/'diagnostic.log'; PROFILE_LOGS=ROOT/'openvpn-logs'; CACHE=ROOT/'servers.json'
-UA='FinduptoVPN/9.0.0'
+UA='FinduptoVPN/9.1.0'
 GATE_URLS=('https://www.vpngate.net/api/iphone/','https://download.vpngate.jp/api/iphone/')
 VPNBOOK_PAGE='https://www.vpnbook.com/freevpn/openvpn'
 VPNBOOK={'us16':('United States','US16'),'us178':('United States','US178'),'ca149':('Canada','CA149'),'ca196':('Canada','CA196'),'uk205':('United Kingdom','UK205'),'uk68':('United Kingdom','UK68'),'de20':('Germany','DE20'),'de220':('Germany','DE220'),'fr200':('France','FR200'),'fr2311':('France','FR231')}
@@ -104,7 +104,18 @@ def _profiles(server:dict)->tuple[list[str],str,str]:
  if server['kind']=='gate':return [base64.b64decode(server['config']+'===').decode('utf-8-sig','replace')],'vpn','vpn'
  return _vpnbook_profiles(server),'vpnbook',_vpnbook_password()
 def _prepare(profile:str,username:str,password:str,path:Path)->None:
- auth=path/'auth.txt';auth.write_text(username+'\n'+password+'\n',encoding='utf-8');lines=[line for line in profile.splitlines() if not line.strip().lower().startswith('auth-user-pass')];lines += [f'auth-user-pass "{auth}"','auth-nocache','resolv-retry infinite','connect-retry 2 3','connect-timeout 10','verb 4'];(path/'client.ovpn').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+ auth=path/'auth.txt';auth.write_text(username+'\n'+password+'\n',encoding='utf-8')
+ lines=[]
+ for line in profile.splitlines():
+  low=line.strip().lower()
+  if low.startswith('auth-user-pass') or low.startswith('route-gateway') or low.startswith('route '):continue
+  lines.append(line)
+ # Force a full-tunnel IPv4 route. Some public profiles omit redirect-gateway,
+ # which makes OpenVPN report CONNECTED while normal browser traffic still uses ISP.
+ lines += ['redirect-gateway def1','route-delay 2','route-metric 5','auth-user-pass "'+str(auth)+'"','auth-nocache','resolv-retry infinite','connect-retry 2 3','connect-timeout 10','persist-key','persist-tun','verb 4']
+ # Prefer the VPN DNS servers when the profile does not already define DNS handling.
+ if not any(x.strip().lower().startswith('dhcp-option dns') for x in lines):lines += ['dhcp-option DNS 1.1.1.1','dhcp-option DNS 8.8.8.8']
+ (path/'client.ovpn').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 def _classify(text:str,code:int|None)->str:
  low=text.lower()
  for key,msg in (('auth_failed','authentication failed'),('options error','OpenVPN configuration error'),('tls error','TLS handshake failed'),('connection refused','connection refused'),('network is unreachable','network unreachable'),('cannot open tun','TUN/TAP adapter unavailable'),('all tap-windows adapters','TUN/TAP adapter unavailable'),('access is denied','administrator permission required')):
@@ -118,7 +129,7 @@ def connect(server:dict,total_deadline:float=50):
   if time.monotonic()-started>=total_deadline:break
   work=Path(tempfile.mkdtemp(prefix='findupto-vpn-'));conf=work/'client.ovpn';_prepare(profile,user,pwd,work);logfile=PROFILE_LOGS/f'{server["host"].replace(":","_")}-{int(time.time())}-v{idx}.log';p=None
   try:
-   p=subprocess.Popen([exe,'--config',str(conf),'--log',str(logfile),'--log-append','--route-delay','2'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));log(f'OPENVPN START server={server["host"]} variant={idx}/{len(profiles)} pid={p.pid} log={logfile}');deadline=min(started+total_deadline,time.monotonic()+14)
+   p=subprocess.Popen([exe,'--config',str(conf),'--log',str(logfile),'--log-append'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0));log(f'OPENVPN START server={server["host"]} variant={idx}/{len(profiles)} pid={p.pid} log={logfile}');deadline=min(started+total_deadline,time.monotonic()+14)
    while time.monotonic()<deadline:
     text=logfile.read_text(encoding='utf-8',errors='replace') if logfile.exists() else ''
     if 'Initialization Sequence Completed' in text:log(f'OPENVPN INITIALIZED server={server["host"]} variant={idx} pid={p.pid}');return p,work,logfile
@@ -140,13 +151,17 @@ def connect(server:dict,total_deadline:float=50):
     except Exception:pass
    shutil.rmtree(work,ignore_errors=True)
  log(f'CONNECT FAIL server={server["host"]} reason={last or "all OpenVPN profiles failed"}');raise RuntimeError(last or 'all OpenVPN profiles failed; see OpenVPN logs')
-def verify_tunnel(timeout:float=8)->str:
- before=None
- try:before=http_get('https://api.ipify.org',timeout,256).decode('ascii','ignore').strip()
- except Exception:pass
+def public_ip(timeout:float=8)->str:
  for url in ('https://api.ipify.org','https://ifconfig.me/ip','https://icanhazip.com'):
   try:
    ip=http_get(url,timeout,256).decode('ascii','ignore').strip()
-   if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',ip) or ':' in ip:log(f'TUNNEL VERIFIED public_ip={ip} previous_ip={before or "unknown"}');return ip
-  except Exception as e:log(f'TUNNEL VERIFY FAIL {url}: {type(e).__name__}: {e}')
- raise RuntimeError('OpenVPN initialized but public-IP verification failed; tunnel is not trusted')
+   if re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}',ip) or ':' in ip:return ip
+  except Exception as e:log(f'PUBLIC IP FAIL {url}: {type(e).__name__}: {e}')
+ raise RuntimeError('Unable to determine public IP')
+def verify_tunnel(previous_ip:str|None=None,timeout:float=8)->str:
+ ip=public_ip(timeout)
+ if previous_ip and ip==previous_ip:
+  log(f'TUNNEL REJECTED public_ip={ip} previous_ip={previous_ip} reason=public IP did not change')
+  raise RuntimeError(f'VPN initialized but traffic is still using the previous public IP ({ip}); full-tunnel route was not established')
+ log(f'TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or "unknown"}')
+ return ip
