@@ -46,6 +46,8 @@ class CoreTests(unittest.TestCase):
                 (2, 7, 6),
             )
             text = config.read_text(encoding="utf-8")
+            self.assertIn("pull-filter ignore \"redirect-gateway\"", text)
+            self.assertIn("pull-filter ignore \"redirect-private\"", text)
             self.assertIn("redirect-gateway def1 bypass-dhcp bypass-dns", text)
             self.assertIn("route 0.0.0.0 128.0.0.0", text)
             self.assertIn("route 128.0.0.0 128.0.0.0", text)
