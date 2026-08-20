@@ -16,12 +16,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
       - name: Upgrade build tooling
         run: python -m pip install --upgrade pip setuptools wheel
+
       - name: Compile Python sources
         run: python -m compileall -q client tests
+
+      - name: Import application modules
+        run: python -c "import sys; sys.path.insert(0, 'client'); import standalone_engine, runtime_bootstrap, gui"
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
+
       - name: Prepare bundled OpenVPN runtime
         shell: pwsh
         run: |
@@ -39,20 +46,25 @@ jobs:
           if (-not $exe) { throw 'Bundled OpenVPN extraction did not contain openvpn.exe' }
           Copy-Item (Join-Path $exe.Directory.FullName '*') $runtime -Recurse -Force
           Get-ChildItem $stage -Recurse -Include *.inf,*.cat,*.sys | ForEach-Object {
-            $target = Join-Path $runtime $_.Name
-            Copy-Item $_.FullName $target -Force
+            Copy-Item $_.FullName (Join-Path $runtime $_.Name) -Force
           }
           if (-not (Test-Path (Join-Path $runtime 'openvpn.exe'))) { throw 'runtime/openvpn.exe missing' }
           & (Join-Path $runtime 'openvpn.exe') --version
+
       - name: Install PyInstaller
         run: python -m pip install --upgrade pyinstaller
+
       - name: Build standalone Windows executable
         run: pyinstaller --clean --noconfirm --onefile --windowed --uac-admin --paths client --add-data "client/runtime;runtime" --name FinduptoVPN client/app.py
-      - name: Verify executable exists
+
+      - name: Smoke-test generated executable metadata
         shell: pwsh
         run: |
           if (-not (Test-Path "dist/FinduptoVPN.exe")) { throw "Build did not produce dist/FinduptoVPN.exe" }
+          $size = (Get-Item "dist/FinduptoVPN.exe").Length
+          if ($size -lt 1000000) { throw "Generated executable is unexpectedly small: $size bytes" }
           Get-Item "dist/FinduptoVPN.exe" | Select-Object FullName,Length
+
       - name: Upload standalone EXE
         uses: actions/upload-artifact@v4
         with:
