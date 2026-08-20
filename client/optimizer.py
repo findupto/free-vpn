@@ -2,6 +2,7 @@ class ConnectionOptimizer:
     def __init__(self):
         self.failures = {}
         self.performance = {}
+        self.cooldowns = {}
         self.last_good_server = None
 
     def record_failure(self, server):
@@ -9,12 +10,22 @@ class ConnectionOptimizer:
 
     def record_performance(self, server, score):
         self.performance[server] = score
+        self.failures[server] = 0
+
+    def penalize_slow(self, server):
+        self.performance[server] = min(
+            self.performance.get(server, 100),
+            20,
+        )
 
     def is_bad(self, server):
         return self.failures.get(server, 0) >= 3
 
     def choose_backup(self, servers):
-        candidates = [s for s in servers if not self.is_bad(s)]
+        candidates = [
+            s for s in servers
+            if not self.is_bad(s)
+        ]
         if not candidates:
             return None
 
