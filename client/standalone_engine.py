@@ -60,7 +60,12 @@ def full_tunnel_routes(snapshot: str) -> bool:
 
 
 def route_snapshot():
-    """Return a snapshot only when BOTH Windows IPv4 /1 routes exist."""
+    """Return all matching Windows IPv4 /1 routes, not only the last few.
+
+    Windows can retain duplicate /1 routes from previous VPN adapters or
+    concurrent routing state. Truncating the matches can hide one half of
+    the def1 pair even though OpenVPN successfully installed both routes.
+    """
     if os.name != "nt":
         return ""
 
@@ -73,7 +78,7 @@ def route_snapshot():
     ]
     prefixes = {line.split()[0] for line in hits if line.split()}
     if {"0.0.0.0", "128.0.0.0"}.issubset(prefixes):
-        return " | ".join(hits[-8:])
+        return " | ".join(hits)
 
     try:
         command = (
@@ -93,7 +98,7 @@ def route_snapshot():
         ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
         ps_prefixes = {x.split()[0] for x in ps_hits if x.split()}
         if {"0.0.0.0/1", "128.0.0.0/1"}.issubset(ps_prefixes):
-            return " | ".join(ps_hits[-8:])
+            return " | ".join(ps_hits)
     except Exception as exc:
         log(f"POWERSHELL ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
 
