@@ -71,6 +71,10 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     try:
+        # Install adaptive server ranking around the existing engine before
+        # the GUI imports its engine module. No new branch or GUI rewrite is
+        # required; the existing connect/discover API stays unchanged.
+        import smart_bootstrap  # noqa: F401
         from gui import App
         App().mainloop()
     except Exception as exc:
