@@ -20,7 +20,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-APP_VERSION = "13.1.4"
+APP_VERSION = "13.1.9"
 ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FinduptoVPN"
 LOG = ROOT / "diagnostic.log"
 PROFILE_LOGS = ROOT / "openvpn-logs"
@@ -338,9 +338,6 @@ def route_snapshot() -> str:
         hits = []
         for line in cp.stdout.splitlines():
             normalized = " ".join(line.strip().split())
-            # Windows can render the route table with different spacing and
-            # localized interface columns. A full-tunnel OpenVPN setup is
-            # represented by both /1 routes: 0/1 and 128/1.
             if re.match(r"^0\.0\.0\.0 128\.0\.0\.0\s+\S+\s+\S+", normalized) or re.match(r"^128\.0\.0\.0 128\.0\.0\.0\s+\S+\s+\S+", normalized):
                 hits.append(normalized)
         return " | ".join(hits[-8:])
@@ -392,19 +389,17 @@ def connect(server: dict, total_deadline: float = 35):
             while time.monotonic() < deadline:
                 text = _read_log(logfile)
                 if "Initialization Sequence Completed" in text:
-                    # Windows installs the pushed/static routes a moment after
-                    # OpenVPN reports initialization. Retry briefly instead of
-                    # declaring a healthy tunnel broken because route.exe has
-                    # not refreshed its table yet.
                     snapshot = ""
-                    route_deadline = time.monotonic() + 4
+                    route_deadline = time.monotonic() + 5
                     while time.monotonic() < route_deadline:
                         snapshot = route_snapshot()
-                        if snapshot:
-                            break
+                        if os.name != "nt" or {p for p in (snapshot or "").split(" | ") if p and p.split()}:
+                            # Let the standalone facade perform the strict both-/1 check.
+                            if os.name != "nt" or ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
+                                break
                         time.sleep(0.25)
-                    if os.name == "nt" and not snapshot:
-                        last = "OpenVPN connected but full-tunnel Windows routes were not installed"
+                    if os.name == "nt" and not ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
+                        last = "OpenVPN connected but both full-tunnel Windows /1 routes were not installed"
                         process.terminate()
                         try:
                             process.wait(timeout=3)
@@ -459,16 +454,16 @@ def public_ip(timeout: float = 8) -> str:
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8) -> str:
     snapshot = ""
     if os.name == "nt":
-        route_deadline = time.monotonic() + 4
+        route_deadline = time.monotonic() + 5
         while time.monotonic() < route_deadline:
             snapshot = route_snapshot()
-            if snapshot:
+            if "0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot:
                 break
             time.sleep(0.25)
-        if not snapshot:
-            raise RuntimeError("VPN process connected, but full-tunnel Windows routes are missing")
+        if not ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
+            raise RuntimeError("VPN process connected, but both full-tunnel Windows /1 routes are missing")
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
         raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
-    log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'}")
+    log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} routes={snapshot or 'non-Windows'}")
     return ip
