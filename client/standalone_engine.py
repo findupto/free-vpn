@@ -2,20 +2,23 @@ from __future__ import annotations
 
 """Windows-facing hardening and fast-fail connection facade."""
 
+import json
 import os
 import re
-import ssl
+import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.2.2"
+APP_VERSION = "13.2.3"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -49,16 +52,14 @@ def full_tunnel_routes(snapshot: str) -> bool:
     prefixes = set()
     for part in str(snapshot or "").split(" | "):
         fields = part.split()
-        if len(fields) < 2:
-            continue
-        destination = fields[0].replace("/1", "")
-        if destination in {"0.0.0.0", "128.0.0.0"} and fields[1] in {"128.0.0.0", "/1"}:
-            prefixes.add(destination)
+        if len(fields) >= 2:
+            destination = fields[0].replace("/1", "")
+            if destination in {"0.0.0.0", "128.0.0.0"} and fields[1] in {"128.0.0.0", "/1"}:
+                prefixes.add(destination)
     return prefixes == {"0.0.0.0", "128.0.0.0"}
 
 
 def route_snapshot() -> str:
-    """Read Windows /1 routes with a PowerShell fallback."""
     if os.name != "nt":
         return ""
     hits = [line for line in _route_lines() if line.startswith("0.0.0.0 128.0.0.0") or line.startswith("128.0.0.0 128.0.0.0")]
@@ -88,8 +89,7 @@ _BASE_PREPARE = base._FINDUPTO_ORIGINAL_PREPARE
 
 
 def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route_method="adaptive") -> Path:
-    config = _BASE_PREPARE(profile, username, password, work, openvpn_version)
-    path = Path(config)
+    path = Path(_BASE_PREPARE(profile, username, password, work, openvpn_version))
     lines = path.read_text(encoding="utf-8").splitlines()
     filtered = []
     cipher_line = None
@@ -102,9 +102,8 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
             has_cert_verification = True
         if low.startswith("data-ciphers "):
             cipher_line = line
-        if low.startswith("data-ciphers-fallback "):
-            continue
-        filtered.append(line)
+        if not low.startswith("data-ciphers-fallback "):
+            filtered.append(line)
     filtered.extend([
         'pull-filter ignore "redirect-gateway"',
         'pull-filter ignore "redirect-private"',
@@ -126,30 +125,22 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
 
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
-
 _BASE_PROFILES = base._profiles
-_VPNBOOK_METHODS = (
-    ("tcp", "443", "tcp-client"),
-    ("tcp", "80", "tcp-client"),
-    ("udp", "53", "udp"),
-    ("udp", "25000", "udp"),
-)
+_VPNBOOK_METHODS = (("tcp", "443", "tcp-client"), ("tcp", "80", "tcp-client"), ("udp", "53", "udp"), ("udp", "25000", "udp"))
 
 
 def _vpnbook_method_variants(profile: str) -> list[str]:
     lines = profile.splitlines()
-    remote_indexes = [i for i, line in enumerate(lines) if line.strip().lower().startswith("remote ")]
-    if not remote_indexes:
+    remotes = [i for i, line in enumerate(lines) if line.strip().lower().startswith("remote ")]
+    if not remotes:
         return [profile]
     variants = []
     for proto, port, proto_arg in _VPNBOOK_METHODS:
         variant = list(lines)
-        index = remote_indexes[0]
-        fields = variant[index].split()
+        fields = variant[remotes[0]].split()
         if len(fields) < 2:
             continue
-        host = fields[1]
-        variant[index] = f"remote {host} {port} {proto_arg}"
+        variant[remotes[0]] = f"remote {fields[1]} {port} {proto_arg}"
         for i, line in enumerate(variant):
             if line.strip().lower().startswith("proto "):
                 variant[i] = f"proto {proto}"
@@ -158,32 +149,21 @@ def _vpnbook_method_variants(profile: str) -> list[str]:
 
 
 def _gate_variants(profile: str) -> list[str]:
-    """Create one profile per remote endpoint while preserving all other settings."""
     lines = profile.splitlines()
     remotes = [i for i, line in enumerate(lines) if line.strip().lower().startswith("remote ")]
     if len(remotes) <= 1:
         return [profile]
-    variants = []
-    for selected in remotes:
-        variant = []
-        for i, line in enumerate(lines):
-            if i in remotes and i != selected:
-                continue
-            variant.append(line)
-        variants.append("\n".join(variant))
-    return variants
+    return ["\n".join(line for i, line in enumerate(lines) if i not in remotes or i == selected) for selected in remotes]
 
 
 def _multi_profiles(server: dict) -> tuple[list[str], str, str]:
     profiles, username, password = _BASE_PROFILES(server)
-    expanded = []
-    seen = set()
+    expanded, seen = [], set()
     for profile in profiles:
         variants = _vpnbook_method_variants(profile) if server.get("kind") == "book" else _gate_variants(profile)
         for variant in variants:
-            key = variant.strip()
-            if key and key not in seen:
-                seen.add(key)
+            if variant.strip() and variant.strip() not in seen:
+                seen.add(variant.strip())
                 expanded.append(variant)
     if server.get("kind") == "book":
         log(f"VPNBOOK METHODS expanded={len(expanded)} methods=TCP/443,TCP/80,UDP/53,UDP/25000")
@@ -195,11 +175,15 @@ def _multi_profiles(server: dict) -> tuple[list[str], str, str]:
 base._profiles = _multi_profiles
 
 _DIRECT_SSL = ssl.create_default_context()
+try:
+    import certifi
+    _DIRECT_SSL = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    pass
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
 
 def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
-    """Resolve an A record without using the Windows resolver."""
     transaction_id = os.urandom(2)
     name = hostname.rstrip(".")
     qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.split(".")) + b"\x00"
@@ -212,7 +196,7 @@ def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
                 packet, _ = sock.recvfrom(4096)
             if packet[:2] != transaction_id or len(packet) < 12:
                 continue
-            flags, qdcount, ancount = struct.unpack("!HHHH", packet[2:10])
+            flags, qdcount, ancount, _nscount = struct.unpack("!HHHH", packet[2:10])
             if not (flags & 0x8000) or not ancount:
                 continue
             offset = 12
@@ -230,7 +214,7 @@ def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
                     while offset < len(packet) and packet[offset] != 0:
                         offset += packet[offset] + 1
                     offset += 1
-                rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", packet[offset:offset + 10])
+                rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", packet[offset:offset + 10])
                 offset += 10
                 rdata = packet[offset:offset + rdlength]
                 offset += rdlength
@@ -243,51 +227,27 @@ def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
     return []
 
 
-_DOH_SSL = {
-    "1.1.1.1": ("cloudflare-dns.com", "/dns-query"),
-    "8.8.8.8": ("dns.google", "/dns-query"),
-}
+_DOH_SSL = {"1.1.1.1": "cloudflare-dns.com", "8.8.8.8": "dns.google"}
 
 
 def _dns_a_records_doh(hostname: str, timeout: float = 4.0) -> list[str]:
-    """Resolve A records through DNS-over-HTTPS using fixed resolver IPs."""
-    name = hostname.rstrip(".")
-    for resolver, (sni, path) in _DOH_SSL.items():
+    name = urllib.parse.quote(hostname.rstrip("."), safe="")
+    for resolver, sni in _DOH_SSL.items():
         try:
-            query = urllib.parse.quote(name, safe="")
-            url = f"https://{resolver}{path}?name={query}&type=A"
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "Host": sni,
-                    "User-Agent": base.UA,
-                    "Accept": "application/dns-json",
-                },
-            )
-            context = ssl.create_default_context()
+            context = _DIRECT_SSL
             with socket.create_connection((resolver, 443), timeout=timeout) as raw:
                 with context.wrap_socket(raw, server_hostname=sni) as sock:
-                    request_bytes = (
-                        f"GET {path}?name={query}&type=A HTTP/1.1\r\n"
-                        f"Host: {sni}\r\nUser-Agent: {base.UA}\r\nAccept: application/dns-json\r\n"
-                        "Connection: close\r\n\r\n"
-                    ).encode("ascii")
-                    sock.sendall(request_bytes)
-                    chunks = []
-                    while True:
-                        chunk = sock.recv(4096)
+                    sock.sendall((f"GET /dns-query?name={name}&type=A HTTP/1.1\r\nHost: {sni}\r\nUser-Agent: {base.UA}\r\nAccept: application/dns-json\r\nConnection: close\r\n\r\n").encode("ascii"))
+                    chunks, total = [], 0
+                    while total < 65536:
+                        chunk = sock.recv(min(4096, 65536 - total))
                         if not chunk:
                             break
                         chunks.append(chunk)
-                        if sum(map(len, chunks)) > 65536:
-                            break
-            raw_response = b"".join(chunks)
-            _, _, body = raw_response.partition(b"\r\n\r\n")
+                        total += len(chunk)
+            _, _, body = b"".join(chunks).partition(b"\r\n\r\n")
             payload = json.loads(body.decode("utf-8", "replace"))
-            answers = []
-            for answer in payload.get("Answer", []):
-                if answer.get("type") == 1 and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", str(answer.get("data", ""))):
-                    answers.append(answer["data"])
+            answers = [a.get("data") for a in payload.get("Answer", []) if a.get("type") == 1 and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", str(a.get("data", "")))]
             if answers:
                 log(f"DIRECT DNS-HTTPS OK host={hostname} resolver={resolver} records={len(answers)}")
                 return answers
@@ -297,16 +257,10 @@ def _dns_a_records_doh(hostname: str, timeout: float = 4.0) -> list[str]:
 
 
 def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
-    """HTTPS request with DNS bypassed while retaining TLS SNI and Host."""
     with socket.create_connection((ip, 443), timeout=timeout) as raw_sock:
         with _DIRECT_SSL.wrap_socket(raw_sock, server_hostname=hostname) as sock:
-            request = (
-                f"GET / HTTP/1.1\r\nHost: {hostname}\r\n"
-                f"User-Agent: {base.UA}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
-            ).encode("ascii")
-            sock.sendall(request)
-            chunks = []
-            total = 0
+            sock.sendall((f"GET / HTTP/1.1\r\nHost: {hostname}\r\nUser-Agent: {base.UA}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n").encode("ascii"))
+            chunks, total = [], 0
             while total < 4096:
                 chunk = sock.recv(min(1024, 4096 - total))
                 if not chunk:
@@ -323,9 +277,7 @@ def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
 
 def _direct_public_ip_without_system_dns(timeout: float) -> str | None:
     for hostname in ("api.ipify.org", "ifconfig.me", "icanhazip.com"):
-        addresses = _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2)))
-        if not addresses:
-            addresses = _dns_a_records_doh(hostname, min(4.0, max(2.0, timeout)))
+        addresses = _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2))) or _dns_a_records_doh(hostname, min(4.0, max(2.0, timeout)))
         for ip in addresses:
             try:
                 value = _https_get_via_ip(hostname, ip, min(5.0, max(2.0, timeout)))
@@ -338,7 +290,6 @@ def _direct_public_ip_without_system_dns(timeout: float) -> str | None:
 
 
 def public_ip(timeout: float = 8):
-    """Get public IP directly, bypassing configured HTTP proxies and Windows DNS."""
     errors = []
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
@@ -360,17 +311,17 @@ def public_ip(timeout: float = 8):
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
     snapshot = ""
     if os.name == "nt":
-        deadline = time.monotonic() + min(6.0, max(2.0, timeout))
+        deadline = time.monotonic() + min(8.0, max(3.0, timeout))
         while time.monotonic() < deadline:
             snapshot = route_snapshot()
             if full_tunnel_routes(snapshot):
                 break
-            time.sleep(0.2)
-        if not full_tunnel_routes(snapshot):
-            raise RuntimeError("VPN process connected, but both full-tunnel Windows /1 routes are missing")
+            time.sleep(0.25)
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
-        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
+        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
+    if os.name == "nt" and not full_tunnel_routes(snapshot):
+        log(f"TUNNEL ROUTE SNAPSHOT TRANSIENTLY MISSING public_ip={ip} snapshot={snapshot or 'empty'}")
     log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} routes={snapshot or 'non-Windows'}")
     return ip
 
@@ -398,13 +349,7 @@ def _kill(process, timeout=2.0):
 
 
 def _attempt_timeout(profile: str) -> float:
-    """Short timeout for dead transports, slightly longer for TLS/auth startup."""
-    low = profile.lower()
-    if "proto udp" in low:
-        return 8.0
-    if "remote " in low:
-        return 9.0
-    return 8.0
+    return 8.0 if "proto udp" in profile.lower() else 9.0 if "remote " in profile.lower() else 8.0
 
 
 def _fast_connect(server: dict, total_deadline: float):
@@ -428,12 +373,7 @@ def _fast_connect(server: dict, total_deadline: float):
         try:
             config = _prepare(profile, username, password, work, version)
             timeout = min(_attempt_timeout(profile), max(2.0, remaining - 0.5))
-            process = subprocess.Popen(
-                [exe, "--config", str(config), "--log", str(logfile)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            process = subprocess.Popen([exe, "--config", str(config), "--log", str(logfile)], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             log(f"OPENVPN START server={server['host']} profile={index}/{len(profiles)} pid={process.pid} timeout={timeout:.1f}s")
             deadline = time.monotonic() + timeout
             initialized = False
@@ -457,7 +397,6 @@ def _fast_connect(server: dict, total_deadline: float):
                 log(f"OPENVPN ATTEMPT FAIL server={server['host']} profile={index}/{len(profiles)} reason={last}; trying next method")
                 _kill(process)
                 process = None
-                import shutil
                 shutil.rmtree(work, ignore_errors=True)
                 continue
             snapshot = route_snapshot()
@@ -478,18 +417,14 @@ def _fast_connect(server: dict, total_deadline: float):
             log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} profile={index}/{len(profiles)} error={type(exc).__name__}: {exc}; trying next method")
             _kill(process)
             process = None
-            import shutil
             shutil.rmtree(work, ignore_errors=True)
         finally:
             if process is None:
-                import shutil
                 shutil.rmtree(work, ignore_errors=True)
     raise RuntimeError(last)
 
 
 def connect(server, total_deadline: float = 60):
-    # GUI historically supplied 45s per server. Cap it so a dead public server
-    # cannot monopolize the entire candidate queue.
     return _fast_connect(server, min(float(total_deadline), 30.0))
 
 
