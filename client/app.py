@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "12.0.2"
+VERSION = "13.1.0"
 
 
 def _is_admin() -> bool:
@@ -21,7 +21,7 @@ def _is_admin() -> bool:
 
 
 def _elevate() -> None:
-    """Relaunch elevated so OpenVPN can create the tunnel and install Windows routes."""
+    """Relaunch elevated so OpenVPN can create the tunnel and install routes."""
     if os.name != "nt" or _is_admin():
         return
 
@@ -42,7 +42,7 @@ def _elevate() -> None:
     )
     if result <= 32:
         raise RuntimeError(
-            "Administrator permission is required to create the Windows VPN tunnel. "
+            "Administrator permission is required to create the VPN tunnel. "
             "Please allow the UAC prompt and start Findupto VPN again."
         )
     raise SystemExit(0)
