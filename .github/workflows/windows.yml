@@ -20,6 +20,9 @@ jobs:
       - name: Upgrade build tooling
         run: python -m pip install --upgrade pip setuptools wheel
 
+      - name: Install project dependencies
+        run: python -m pip install --upgrade -r client/requirements.txt
+
       - name: Compile Python sources
         run: python -m compileall -q client tests
 
