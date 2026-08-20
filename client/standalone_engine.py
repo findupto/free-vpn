@@ -113,9 +113,9 @@ if not hasattr(base, "_FINDUPTO_ORIGINAL_PREPARE"):
 _BASE_PREPARE = base._FINDUPTO_ORIGINAL_PREPARE
 
 
-def _prepare(*args, **kwargs):
-    """Harden generated profiles for reliable Windows full-tunnel routing."""
-    config = _BASE_PREPARE(*args, **kwargs)
+def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route_method="exe") -> Path:
+    """Harden generated profiles for reliable full-tunnel routing."""
+    config = _BASE_PREPARE(profile, username, password, work, openvpn_version)
     path = Path(config)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -126,6 +126,8 @@ def _prepare(*args, **kwargs):
             if low.startswith("route 0.0.0.0 128.0.0.0") or low.startswith("route 128.0.0.0 128.0.0.0"):
                 continue
             if low.startswith("redirect-gateway "):
+                continue
+            if low.startswith("route-method "):
                 continue
             if low.startswith("data-ciphers "):
                 cipher_line = line
@@ -140,7 +142,8 @@ def _prepare(*args, **kwargs):
         filtered.append('pull-filter ignore "redirect-private"')
         filtered.append("redirect-gateway def1 bypass-dhcp bypass-dns")
         filtered.append("route-metric 5")
-        filtered.append("route-method exe")
+        if os.name == "nt" and route_method:
+            filtered.append(f"route-method {route_method}")
         filtered.append("route-delay 2 30")
         filtered.append("show-net-up")
         filtered.append("disable-dco")
