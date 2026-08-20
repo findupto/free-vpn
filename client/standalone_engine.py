@@ -12,7 +12,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.1.7"
+APP_VERSION = "13.1.8"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -49,6 +49,18 @@ def _route_lines() -> list[str]:
         return []
 
 
+def full_tunnel_routes(snapshot: str) -> bool:
+    """Return True only when both Windows IPv4 /1 routes are present."""
+    if os.name != "nt":
+        return True
+    prefixes = set()
+    for part in str(snapshot or "").split(" | "):
+        fields = part.split()
+        if len(fields) >= 2 and fields[0] in {"0.0.0.0", "128.0.0.0"} and fields[1] == "128.0.0.0":
+            prefixes.add(fields[0])
+    return prefixes == {"0.0.0.0", "128.0.0.0"}
+
+
 def route_snapshot():
     """Return a snapshot only when BOTH Windows IPv4 /1 routes exist."""
     if os.name != "nt":
@@ -60,7 +72,8 @@ def route_snapshot():
         if line.startswith("0.0.0.0 128.0.0.0")
         or line.startswith("128.0.0.0 128.0.0.0")
     ]
-    if len({line.split()[0] for line in hits}) >= 2:
+    prefixes = {line.split()[0] for line in hits if line.split()}
+    if {"0.0.0.0", "128.0.0.0"}.issubset(prefixes):
         return " | ".join(hits[-8:])
 
     try:
@@ -68,7 +81,7 @@ def route_snapshot():
             "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
             "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
             "$_.DestinationPrefix -eq '128.0.0.0/1' } "
-            "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + $_.InterfaceIndex }"
+            "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + $_.InterfaceIndex + ' ' + $_.RouteMetric }"
         )
         cp = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -79,8 +92,8 @@ def route_snapshot():
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
-        prefixes = set(x.split()[0] for x in ps_hits if x.split())
-        if {"0.0.0.0/1", "128.0.0.0/1"}.issubset(prefixes):
+        ps_prefixes = {x.split()[0] for x in ps_hits if x.split()}
+        if {"0.0.0.0/1", "128.0.0.0/1"}.issubset(ps_prefixes):
             return " | ".join(ps_hits[-8:])
     except Exception as exc:
         log(f"POWERSHELL ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
@@ -88,26 +101,44 @@ def route_snapshot():
     return ""
 
 
-# Preserve the original helper before overriding the global used by
-# base.connect(). This prevents the recursive base._prepare = _prepare bug.
-_BASE_PREPARE = base._prepare
+# Keep the pristine base helper across reloads. Re-importing this module must
+# never capture our already-wrapped _prepare, otherwise repeated launches or
+# test reloads can recurse forever.
+if not hasattr(base, "_FINDUPTO_ORIGINAL_PREPARE"):
+    base._FINDUPTO_ORIGINAL_PREPARE = base._prepare
+_BASE_PREPARE = base._FINDUPTO_ORIGINAL_PREPARE
 
 
 def _prepare(*args, **kwargs):
-    """Harden generated profiles with OpenVPN's native def1 full-tunnel mode."""
+    """Harden generated profiles for reliable Windows full-tunnel routing."""
     config = _BASE_PREPARE(*args, **kwargs)
+    path = Path(config)
     try:
-        path = Path(config)
         lines = path.read_text(encoding="utf-8").splitlines()
         filtered = []
+        has_cipher = False
         for line in lines:
             low = line.strip().lower()
             if low.startswith("route 0.0.0.0 128.0.0.0") or low.startswith("route 128.0.0.0 128.0.0.0"):
                 continue
             if low.startswith("redirect-gateway "):
                 continue
+            if low.startswith("data-ciphers "):
+                has_cipher = True
             filtered.append(line)
-        filtered.append("redirect-gateway def1")
+
+        # Prefer OpenVPN's native def1 routing. It creates both /1 routes and
+        # avoids relying on a server-pushed redirect-gateway directive.
+        filtered.append("redirect-gateway def1 bypass-dhcp bypass-dns")
+        filtered.append("route-metric 5")
+        filtered.append("route-method exe")
+        filtered.append("route-delay 2 30")
+        filtered.append("show-net-up")
+        filtered.append("disable-dco")
+        if not has_cipher:
+            filtered.append("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC")
+            filtered.append("data-ciphers-fallback AES-256-CBC")
+
         path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
     except Exception as exc:
         log(f"PROFILE HARDENING FAIL error={type(exc).__name__}: {exc}")
@@ -115,7 +146,7 @@ def _prepare(*args, **kwargs):
     return config
 
 
-# base.connect() resolves these helpers in vpn_engine's own global namespace.
+# base.connect() resolves helpers in vpn_engine's own global namespace.
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
@@ -148,7 +179,7 @@ def public_ip(timeout: float = 8):
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
     """Verify both full-tunnel routes and a changed public IP."""
     snapshot = route_snapshot()
-    if os.name == "nt" and not snapshot:
+    if os.name == "nt" and not full_tunnel_routes(snapshot):
         raise RuntimeError("VPN initialized but both Windows full-tunnel /1 routes are missing")
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
