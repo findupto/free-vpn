@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 import ssl
+import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.2.0"
+APP_VERSION = "13.2.1"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -196,8 +198,91 @@ _DIRECT_SSL = ssl.create_default_context()
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
 
+def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
+    """Resolve an A record without using the Windows resolver."""
+    transaction_id = os.urandom(2)
+    name = hostname.rstrip(".")
+    qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.split(".")) + b"\x00"
+    query = transaction_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+    for resolver in ("1.1.1.1", "8.8.8.8"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(query, (resolver, 53))
+                packet, _ = sock.recvfrom(4096)
+            if packet[:2] != transaction_id or len(packet) < 12:
+                continue
+            flags, qdcount, ancount = struct.unpack("!HHHH", packet[2:10])
+            if not (flags & 0x8000) or not ancount:
+                continue
+            offset = 12
+            for _ in range(qdcount):
+                while offset < len(packet) and packet[offset] != 0:
+                    offset += packet[offset] + 1
+                offset += 5
+            answers = []
+            for _ in range(ancount):
+                if offset + 12 > len(packet):
+                    break
+                if packet[offset] & 0xC0 == 0xC0:
+                    offset += 2
+                else:
+                    while offset < len(packet) and packet[offset] != 0:
+                        offset += packet[offset] + 1
+                    offset += 1
+                rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", packet[offset:offset + 10])
+                offset += 10
+                rdata = packet[offset:offset + rdlength]
+                offset += rdlength
+                if rtype == 1 and rclass == 1 and rdlength == 4:
+                    answers.append(socket.inet_ntoa(rdata))
+            if answers:
+                return answers
+        except OSError as exc:
+            log(f"DIRECT DNS FAIL host={hostname} resolver={resolver} error={type(exc).__name__}: {exc}")
+    return []
+
+
+def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
+    """HTTPS request with DNS bypassed while retaining TLS SNI and Host."""
+    with socket.create_connection((ip, 443), timeout=timeout) as raw_sock:
+        with _DIRECT_SSL.wrap_socket(raw_sock, server_hostname=hostname) as sock:
+            request = (
+                f"GET / HTTP/1.1\r\nHost: {hostname}\r\n"
+                f"User-Agent: {base.UA}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
+            ).encode("ascii")
+            sock.sendall(request)
+            chunks = []
+            total = 0
+            while total < 4096:
+                chunk = sock.recv(min(1024, 4096 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+    response = b"".join(chunks)
+    head, _, body = response.partition(b"\r\n\r\n")
+    status = re.search(rb"^HTTP/\d(?:\.\d)?\s+(\d+)", head)
+    if not status or status.group(1) not in {b"200", b"204"}:
+        raise RuntimeError(f"HTTP status {status.group(1).decode() if status else 'unknown'}")
+    return body.decode("ascii", "ignore").strip()
+
+
+def _direct_public_ip_without_system_dns(timeout: float) -> str | None:
+    for hostname in ("api.ipify.org", "ifconfig.me", "icanhazip.com"):
+        for ip in _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2))):
+            try:
+                value = _https_get_via_ip(hostname, ip, min(5.0, max(2.0, timeout)))
+                if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
+                    log(f"PUBLIC IP DIRECT DNS-BYPASS host={hostname} ip={ip} public_ip={value}")
+                    return value
+            except Exception as exc:
+                log(f"PUBLIC IP DNS-BYPASS FAIL host={hostname} ip={ip} error={type(exc).__name__}: {exc}")
+    return None
+
+
 def public_ip(timeout: float = 8):
-    """Get public IP directly, bypassing configured HTTP proxies."""
+    """Get public IP directly, bypassing configured HTTP proxies and Windows DNS."""
     errors = []
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
@@ -210,7 +295,10 @@ def public_ip(timeout: float = 8):
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
             log(f"PUBLIC IP DIRECT FAIL url={url} error={type(exc).__name__}: {exc}")
-    raise RuntimeError("Unable to determine public IP without proxy: " + " | ".join(errors[-2:]))
+    fallback = _direct_public_ip_without_system_dns(timeout)
+    if fallback:
+        return fallback
+    raise RuntimeError("Unable to determine public IP without proxy or system DNS: " + " | ".join(errors[-2:]))
 
 
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
@@ -313,8 +401,8 @@ def _fast_connect(server: dict, total_deadline: float):
                 log(f"OPENVPN ATTEMPT FAIL server={server['host']} profile={index}/{len(profiles)} reason={last}; trying next method")
                 _kill(process)
                 process = None
-                shutil_rmtree = getattr(__import__('shutil'), 'rmtree')
-                shutil_rmtree(work, ignore_errors=True)
+                import shutil
+                shutil.rmtree(work, ignore_errors=True)
                 continue
             snapshot = route_snapshot()
             if os.name == "nt" and not full_tunnel_routes(snapshot):
@@ -337,7 +425,6 @@ def _fast_connect(server: dict, total_deadline: float):
             import shutil
             shutil.rmtree(work, ignore_errors=True)
         finally:
-            # Successful attempts deliberately keep work/auth/config alive until disconnect.
             if process is None:
                 import shutil
                 shutil.rmtree(work, ignore_errors=True)
