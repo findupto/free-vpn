@@ -15,7 +15,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.2.1"
+APP_VERSION = "13.2.2"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -243,6 +243,59 @@ def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
     return []
 
 
+_DOH_SSL = {
+    "1.1.1.1": ("cloudflare-dns.com", "/dns-query"),
+    "8.8.8.8": ("dns.google", "/dns-query"),
+}
+
+
+def _dns_a_records_doh(hostname: str, timeout: float = 4.0) -> list[str]:
+    """Resolve A records through DNS-over-HTTPS using fixed resolver IPs."""
+    name = hostname.rstrip(".")
+    for resolver, (sni, path) in _DOH_SSL.items():
+        try:
+            query = urllib.parse.quote(name, safe="")
+            url = f"https://{resolver}{path}?name={query}&type=A"
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Host": sni,
+                    "User-Agent": base.UA,
+                    "Accept": "application/dns-json",
+                },
+            )
+            context = ssl.create_default_context()
+            with socket.create_connection((resolver, 443), timeout=timeout) as raw:
+                with context.wrap_socket(raw, server_hostname=sni) as sock:
+                    request_bytes = (
+                        f"GET {path}?name={query}&type=A HTTP/1.1\r\n"
+                        f"Host: {sni}\r\nUser-Agent: {base.UA}\r\nAccept: application/dns-json\r\n"
+                        "Connection: close\r\n\r\n"
+                    ).encode("ascii")
+                    sock.sendall(request_bytes)
+                    chunks = []
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if sum(map(len, chunks)) > 65536:
+                            break
+            raw_response = b"".join(chunks)
+            _, _, body = raw_response.partition(b"\r\n\r\n")
+            payload = json.loads(body.decode("utf-8", "replace"))
+            answers = []
+            for answer in payload.get("Answer", []):
+                if answer.get("type") == 1 and re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", str(answer.get("data", ""))):
+                    answers.append(answer["data"])
+            if answers:
+                log(f"DIRECT DNS-HTTPS OK host={hostname} resolver={resolver} records={len(answers)}")
+                return answers
+        except Exception as exc:
+            log(f"DIRECT DNS-HTTPS FAIL host={hostname} resolver={resolver} error={type(exc).__name__}: {exc}")
+    return []
+
+
 def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
     """HTTPS request with DNS bypassed while retaining TLS SNI and Host."""
     with socket.create_connection((ip, 443), timeout=timeout) as raw_sock:
@@ -270,7 +323,10 @@ def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
 
 def _direct_public_ip_without_system_dns(timeout: float) -> str | None:
     for hostname in ("api.ipify.org", "ifconfig.me", "icanhazip.com"):
-        for ip in _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2))):
+        addresses = _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2)))
+        if not addresses:
+            addresses = _dns_a_records_doh(hostname, min(4.0, max(2.0, timeout)))
+        for ip in addresses:
             try:
                 value = _https_get_via_ip(hostname, ip, min(5.0, max(2.0, timeout)))
                 if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
