@@ -123,6 +123,58 @@ base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
 
+# Keep the original profile loader, then expand VPNBook into explicit transport
+# fallbacks. This matters when the live bundle is missing one of the usual
+# profiles: we still try TCP/443, TCP/80, UDP/53 and UDP/25000 ourselves.
+_BASE_PROFILES = base._profiles
+_VPNBOOK_METHODS = (
+    ("tcp", "443", "tcp-client"),
+    ("tcp", "80", "tcp-client"),
+    ("udp", "53", "udp"),
+    ("udp", "25000", "udp"),
+)
+
+
+def _vpnbook_method_variants(profile: str) -> list[str]:
+    lines = profile.splitlines()
+    remote_indexes = [i for i, line in enumerate(lines) if line.strip().lower().startswith("remote ")]
+    if not remote_indexes:
+        return [profile]
+    variants = []
+    for proto, port, proto_arg in _VPNBOOK_METHODS:
+        variant = list(lines)
+        index = remote_indexes[0]
+        fields = variant[index].split()
+        if len(fields) < 2:
+            continue
+        host = fields[1]
+        variant[index] = f"remote {host} {port} {proto_arg}"
+        for i, line in enumerate(variant):
+            if line.strip().lower().startswith("proto "):
+                variant[i] = f"proto {proto}"
+        variants.append("\n".join(variant))
+    return variants or [profile]
+
+
+def _multi_profiles(server: dict) -> tuple[list[str], str, str]:
+    profiles, username, password = _BASE_PROFILES(server)
+    if server.get("kind") != "book":
+        return profiles, username, password
+    expanded = []
+    seen = set()
+    for profile in profiles:
+        for variant in _vpnbook_method_variants(profile):
+            key = variant.strip()
+            if key and key not in seen:
+                seen.add(key)
+                expanded.append(variant)
+    log(f"VPNBOOK METHODS expanded={len(expanded)} methods=TCP/443,TCP/80,UDP/53,UDP/25000")
+    return expanded, username, password
+
+
+base._profiles = _multi_profiles
+
+
 _DIRECT_SSL = ssl.create_default_context()
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
@@ -161,8 +213,8 @@ def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
     return ip
 
 
-def connect(*args, **kwargs):
-    return base.connect(*args, **kwargs)
+def connect(server, total_deadline: float = 60):
+    return base.connect(server, total_deadline=total_deadline)
 
 
 def discover(deadline: float = 10):
