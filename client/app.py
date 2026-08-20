@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "13.1.0"
+VERSION = "13.1.1"
 
 
 def _is_admin() -> bool:
@@ -20,36 +20,46 @@ def _is_admin() -> bool:
         return False
 
 
-def _elevate() -> None:
-    """Relaunch elevated so OpenVPN can create the tunnel and install routes."""
+def _elevate() -> bool:
+    """Start an elevated copy and return whether the current process should continue."""
     if os.name != "nt" or _is_admin():
-        return
+        return True
 
-    if getattr(sys, "frozen", False):
-        executable = sys.executable
-        parameters = ""
-    else:
-        executable = sys.executable
-        parameters = subprocess.list2cmdline([str(Path(__file__).resolve())])
-
+    executable = sys.executable
+    script = str(Path(__file__).resolve())
+    parameters = subprocess.list2cmdline([script])
     result = ctypes.windll.shell32.ShellExecuteW(
         None,
         "runas",
         executable,
         parameters,
-        str(Path(executable).resolve().parent),
+        str(Path(script).parent),
         1,
     )
-    if result <= 32:
-        raise RuntimeError(
-            "Administrator permission is required to create the VPN tunnel. "
-            "Please allow the UAC prompt and start Findupto VPN again."
+    return result > 32
+
+
+def _show_elevation_error() -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Findupto VPN needs Administrator permission to create the VPN tunnel.\n\n"
+            "Please run app.py again and click Yes on the Windows permission prompt.",
+            "Findupto VPN",
+            0x10,
         )
-    raise SystemExit(0)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
-    _elevate()
-    from gui import App
+    if os.name == "nt" and not _is_admin():
+        # A successful UAC launch means the elevated child is now responsible
+        # for the GUI. The original process must exit immediately.
+        if _elevate():
+            raise SystemExit(0)
+        _show_elevation_error()
+        raise SystemExit(1)
 
+    from gui import App
     App().mainloop()
