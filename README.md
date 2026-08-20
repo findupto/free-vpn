@@ -2,26 +2,18 @@
 
 A lightweight desktop VPN client that discovers live public OpenVPN servers, ranks them, retries multiple profiles and servers, and refuses to report success until the tunnel is actually usable.
 
-## v13.1.0
+## v13.1.9
 
-This release focuses on reliability, portability, and faster recovery from broken public VPN endpoints:
+This release fixes the Windows connection failures shown by recent diagnostics:
 
-- standalone runtime version is now consistent across the application;
-- the packaged Windows build bundles the official OpenVPN Community 2.7.6 runtime;
-- OpenVPN lookup prefers the bundled runtime, then `FINDUPTO_OPENVPN`, then the system PATH;
-- Windows route retries use valid OpenVPN route methods (`adaptive`, `ipapi`, `exe`);
-- full-tunnel verification requires both Windows `0.0.0.0/1` and `128.0.0.0/1` routes;
-- IPv6 is blocked on Windows for IPv4-only public profiles to prevent common IPv6 bypasses;
-- Windows outside-DNS blocking is enabled for the generated profile;
-- OpenVPN 2.6+ DCO is disabled for compatibility with public community profiles;
-- legacy cipher negotiation is retained for older server configurations;
-- discovery remains concurrent and cache-backed so slow or dead public catalogs do not block the UI;
-- only validated VPN Gate and VPNBook catalog formats can enter the cache or connection path;
-- the client retries more candidates before giving up;
-- successful connections are verified with route state and a changed public IP;
-- the GUI scales down to smaller desktop displays and supports horizontal scrolling;
-- diagnostic log opening works on Windows, macOS, and Linux;
-- regression tests cover profile hardening, route validation, legacy ciphers, cache validation, and platform-specific route options.
+- OpenVPN profile preparation is reload-safe; repeated module imports can no longer recurse through the `_prepare` wrapper;
+- Windows full-tunnel validation now requires **both** `0.0.0.0/1` and `128.0.0.0/1` routes before a tunnel is considered initialized;
+- generated Windows profiles use OpenVPN `redirect-gateway def1` with route metric and route delay settings instead of relying on a single pushed `/1` route;
+- OpenVPN DCO is explicitly disabled for public/community profiles;
+- legacy CBC profiles retain explicit `data-ciphers` and `data-ciphers-fallback` compatibility;
+- public-IP verification bypasses configured HTTP(S) proxies so the verification request follows the machine's actual routing table;
+- the application, standalone engine, and core engine versions are synchronized at 13.1.9;
+- the existing strict rule remains: a connection is successful only when the tunnel is initialized, the Windows full-tunnel routes are installed, and the public IP changes.
 
 ## Supported platforms
 
@@ -38,7 +30,7 @@ Android and iOS are not supported by this desktop Tkinter application. They requ
 - Internet access
 - Administrator/UAC approval
 
-The repository does not commit third-party binaries. GitHub Actions downloads the official OpenVPN Community 2.7.6 Windows runtime and packages it into `FinduptoVPN.exe`.
+The repository does not commit third-party binaries. GitHub Actions downloads the official OpenVPN Community Windows runtime and packages it into `FinduptoVPN.exe`.
 
 ### Run from source
 
