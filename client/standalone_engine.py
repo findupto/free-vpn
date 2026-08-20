@@ -104,7 +104,7 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
         'pull-filter ignore "redirect-gateway"',
         'pull-filter ignore "redirect-private"',
         "redirect-gateway def1 bypass-dhcp bypass-dns",
-        "route-metric 5",
+        "route-metric 1",
         *([f"route-method {route_method}"] if os.name == "nt" and route_method else []),
         "route-delay 2 30",
         "show-net-up",
@@ -121,6 +121,7 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
 
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
+
 
 _DIRECT_SSL = ssl.create_default_context()
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
