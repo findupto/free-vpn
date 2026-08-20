@@ -20,7 +20,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-APP_VERSION = "13.1.3"
+APP_VERSION = "13.1.4"
 ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "FinduptoVPN"
 LOG = ROOT / "diagnostic.log"
 PROFILE_LOGS = ROOT / "openvpn-logs"
@@ -170,8 +170,7 @@ def _cache_load() -> list[dict]:
         data = json.loads(CACHE.read_text(encoding="utf-8"))
         if time.time() - float(data.get("time", 0)) < CACHE_TTL:
             raw_servers = data.get("servers", [])
-            servers = [s for s in raw_servers if isinstance(s, dict) and _is_real_server(s)]
-            return servers
+            return [s for s in raw_servers if isinstance(s, dict) and _is_real_server(s)]
     except Exception as exc:
         if CACHE.exists():
             log(f"CACHE LOAD FAIL error={type(exc).__name__}: {exc}")
@@ -310,18 +309,13 @@ def _prepare(profile: str, username: str, password: str, work: Path, openvpn_ver
         lines.append(original)
     if not has_dev:
         lines.append("dev tun")
-    lines.extend(["client", "redirect-gateway def1", "route 0.0.0.0 128.0.0.0", "route 128.0.0.0 128.0.0.0", "route-metric 5", f'auth-user-pass "{_ovpn_path(auth)}"', "auth-nocache", "resolv-retry infinite", "connect-retry 2 3", "connect-timeout 10", "persist-tun", "verb 3"])
-    if openvpn_version >= (2, 6, 0):
-        lines.append("disable-dco")
-    if legacy_cipher:
-        modern = "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
-        if legacy_cipher.upper() not in modern.upper().split(":"):
-            lines.append(f"data-ciphers {modern}:{legacy_cipher}")
-            lines.append(f"data-ciphers-fallback {legacy_cipher}")
-    if has_compression and openvpn_version >= (2, 6, 0):
-        lines.extend(["allow-compression asym", "comp-lzo"])
-    if os.name == "nt" and os.environ.get("FINDUPTO_BLOCK_OUTSIDE_DNS") == "1":
-        lines.append("block-outside-dns")
+    if legacy_cipher and not any(x.lower().startswith("data-ciphers ") for x in lines):
+        lines.append(f"data-ciphers {legacy_cipher}:AES-256-GCM:AES-128-GCM")
+    if not any(x.lower().startswith("auth-user-pass") for x in lines):
+        lines.append(f"auth-user-pass {_ovpn_path(auth)}")
+    lines.extend(["auth-nocache", "verb 3", "route-method exe", "route-delay 2 10", "route 0.0.0.0 128.0.0.0", "route 128.0.0.0 128.0.0.0"])
+    if has_compression:
+        lines.append("allow-compression yes")
     config = work / "client.ovpn"
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config
@@ -341,8 +335,15 @@ def route_snapshot() -> str:
         return ""
     try:
         cp = subprocess.run(["route", "print", "-4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        hits = [line.strip() for line in cp.stdout.splitlines() if re.search(r"(^|\s)(0\.0\.0\.0|128\.0\.0\.0)\s+128\.0\.0\.0\s", line)]
-        return " | ".join(hits[-4:])
+        hits = []
+        for line in cp.stdout.splitlines():
+            normalized = " ".join(line.strip().split())
+            # Windows can render the route table with different spacing and
+            # localized interface columns. A full-tunnel OpenVPN setup is
+            # represented by both /1 routes: 0/1 and 128/1.
+            if re.match(r"^0\.0\.0\.0 128\.0\.0\.0\s+\S+\s+\S+", normalized) or re.match(r"^128\.0\.0\.0 128\.0\.0\.0\s+\S+\s+\S+", normalized):
+                hits.append(normalized)
+        return " | ".join(hits[-8:])
     except Exception as exc:
         log(f"ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
         return ""
@@ -391,7 +392,17 @@ def connect(server: dict, total_deadline: float = 35):
             while time.monotonic() < deadline:
                 text = _read_log(logfile)
                 if "Initialization Sequence Completed" in text:
-                    snapshot = route_snapshot()
+                    # Windows installs the pushed/static routes a moment after
+                    # OpenVPN reports initialization. Retry briefly instead of
+                    # declaring a healthy tunnel broken because route.exe has
+                    # not refreshed its table yet.
+                    snapshot = ""
+                    route_deadline = time.monotonic() + 4
+                    while time.monotonic() < route_deadline:
+                        snapshot = route_snapshot()
+                        if snapshot:
+                            break
+                        time.sleep(0.25)
                     if os.name == "nt" and not snapshot:
                         last = "OpenVPN connected but full-tunnel Windows routes were not installed"
                         process.terminate()
@@ -446,9 +457,16 @@ def public_ip(timeout: float = 8) -> str:
 
 
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8) -> str:
-    snapshot = route_snapshot()
-    if os.name == "nt" and not snapshot:
-        raise RuntimeError("VPN process connected, but full-tunnel Windows routes are missing")
+    snapshot = ""
+    if os.name == "nt":
+        route_deadline = time.monotonic() + 4
+        while time.monotonic() < route_deadline:
+            snapshot = route_snapshot()
+            if snapshot:
+                break
+            time.sleep(0.25)
+        if not snapshot:
+            raise RuntimeError("VPN process connected, but full-tunnel Windows routes are missing")
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
         raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
