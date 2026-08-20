@@ -27,6 +27,7 @@ class App(tk.Tk):
         self.tmp = None
         self.current_log = None
         self.busy = False
+        self.cancel_event = threading.Event()
         self._build()
         self.after(100, self._pump)
         self.refresh()
@@ -44,7 +45,6 @@ class App(tk.Tk):
         ttk.Label(head, text=f"  Live Free VPN • {VERSION}").pack(side="left", pady=7)
         self.status = tk.StringVar(value="Starting...")
         ttk.Label(self, textvariable=self.status, padding=(14, 0, 14, 10)).pack(fill="x")
-
         frame = ttk.Frame(self, padding=(14, 0, 14, 0))
         frame.pack(fill="both", expand=True)
         cols = ("country", "city", "host", "ip", "ping", "speed", "source")
@@ -61,7 +61,6 @@ class App(tk.Tk):
         x.grid(row=1, column=0, sticky="ew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
-
         bar = ttk.Frame(self, padding=14)
         bar.pack(fill="x")
         self.refresh_btn = ttk.Button(bar, text="Refresh Live Servers", command=self.refresh)
@@ -83,6 +82,7 @@ class App(tk.Tk):
     def refresh(self):
         if self.busy:
             return
+        self.cancel_event.clear()
         self._set_busy(True)
         self.status.set("Discovering live public VPN servers...")
         threading.Thread(target=self._discover_worker, daemon=True).start()
@@ -101,20 +101,7 @@ class App(tk.Tk):
         for index, server in enumerate(data):
             ping = "-" if server.get("ping", 9999) >= 9999 else f"{server['ping']:.0f} ms"
             speed = "-" if not server.get("speed") else f"{server['speed']:.1f} Mbps"
-            self.tree.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(
-                    server.get("country", ""),
-                    server.get("city", ""),
-                    server.get("host", ""),
-                    server.get("ip", ""),
-                    ping,
-                    speed,
-                    server.get("source", ""),
-                ),
-            )
+            self.tree.insert("", "end", iid=str(index), values=(server.get("country", ""), server.get("city", ""), server.get("host", ""), server.get("ip", ""), ping, speed, server.get("source", "")))
 
     def best(self):
         if not self.servers:
@@ -137,11 +124,24 @@ class App(tk.Tk):
         if not candidates:
             messagebox.showwarning(APP, "No valid server candidates are available.")
             return
+        self.cancel_event.clear()
         self._set_busy(True)
-        self.status.set(
-            f"Trying {len(candidates)} live candidates; full-tunnel verification is mandatory..."
-        )
+        self.status.set(f"Trying {len(candidates)} live candidates; full-tunnel verification is mandatory...")
         threading.Thread(target=self._connect_worker, args=(candidates,), daemon=True).start()
+
+    @staticmethod
+    def _stop_process(process, tmp=None):
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _connect_worker(self, candidates):
         errors = []
@@ -151,76 +151,53 @@ class App(tk.Tk):
         except Exception as exc:
             baseline = None
             engine.log(f"CONNECT BASELINE unavailable error={type(exc).__name__}: {exc}")
-
         for server in candidates:
-            if self.process is not None:
+            if self.cancel_event.is_set() or self.process is not None:
                 return
             try:
                 self.events.put(("status", None, f"Trying {server['host']} ({server['source']})..."))
                 if not runtime_bootstrap.install_bundled_drivers():
-                    engine.log(
-                        "RUNTIME DRIVER bootstrap: no bundled INF installed; "
-                        "continuing with existing driver"
-                    )
+                    engine.log("RUNTIME DRIVER bootstrap: no bundled INF installed; continuing with existing driver")
                 process, tmp, logfile = engine.connect(server, 45)
+                if self.cancel_event.is_set():
+                    self._stop_process(process, tmp)
+                    self.events.put(("cancelled", None, "Disconnected"))
+                    return
                 try:
                     if process.poll() is not None:
                         raise RuntimeError("VPN process exited immediately after initialization")
                     ip = engine.verify_tunnel(baseline, 10)
                 except Exception as verify_exc:
-                    engine.log(
-                        f"POST-CONNECT VERIFICATION FAIL server={server['host']} "
-                        f"error={type(verify_exc).__name__}: {verify_exc}"
-                    )
-                    try:
-                        process.terminate()
-                        process.wait(timeout=3)
-                    except Exception:
-                        try:
-                            process.kill()
-                        except Exception:
-                            pass
-                    shutil.rmtree(tmp, ignore_errors=True)
+                    engine.log(f"POST-CONNECT VERIFICATION FAIL server={server['host']} error={type(verify_exc).__name__}: {verify_exc}")
+                    self._stop_process(process, tmp)
                     raise
+                if self.cancel_event.is_set():
+                    self._stop_process(process, tmp)
+                    self.events.put(("cancelled", None, "Disconnected"))
+                    return
                 self.process, self.tmp, self.current_log = process, tmp, logfile
-                engine.log(
-                    f"VPN CONNECTED AND VERIFIED server={server['host']} public_ip={ip}"
-                )
-                self.events.put(
-                    ("connected", None, f"CONNECTED — {server['host']} — public IP {ip}")
-                )
+                engine.log(f"VPN CONNECTED AND VERIFIED server={server['host']} public_ip={ip}")
+                self.events.put(("connected", None, f"CONNECTED — {server['host']} — public IP {ip}"))
                 return
             except Exception as exc:
                 message = f"{server['host']}: {exc}"
                 errors.append(message)
                 engine.log(message)
-        self.events.put(
-            (
-                "error",
-                None,
-                "No candidate connected successfully.\n\n"
-                + "\n".join(errors[:20])
-                + f"\n\nDiagnostic log:\n{engine.LOG}\nLatest OpenVPN failure log:\n{engine.PROFILE_LOGS}",
-            )
-        )
+        if not self.cancel_event.is_set():
+            self.events.put(("error", None, "No candidate connected successfully.\n\n" + "\n".join(errors[:20]) + f"\n\nDiagnostic log:\n{engine.LOG}\nLatest OpenVPN failure log:\n{engine.PROFILE_LOGS}"))
 
     def disconnect(self):
+        self.cancel_event.set()
         process = self.process
+        tmp = self.tmp
         self.process = None
+        self.tmp = None
+        self.current_log = None
         if process is not None:
             engine.log("DISCONNECT")
-            try:
-                process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-        if self.tmp:
-            shutil.rmtree(self.tmp, ignore_errors=True)
-            self.tmp = None
-        self.current_log = None
+            self._stop_process(process, tmp)
+        elif tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
         if hasattr(self, "status"):
             self.status.set("Disconnected")
         if hasattr(self, "refresh_btn"):
@@ -262,6 +239,9 @@ class App(tk.Tk):
                 elif kind == "status":
                     self.status.set(message)
                 elif kind == "connected":
+                    self._set_busy(False)
+                    self.status.set(message)
+                elif kind == "cancelled":
                     self._set_busy(False)
                     self.status.set(message)
                 elif kind == "error":
