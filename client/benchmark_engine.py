@@ -9,31 +9,34 @@ class BenchmarkEngine:
     def __init__(self):
         self.history = {}
 
-    def score(self, server, latency_ms, success=True, speed_mbps=0, packet_loss=0):
-        old = self.history.setdefault(server, {"samples": []})
-        old["samples"].append({
+    def score(self, server, latency_ms, success=True, speed_mbps=0, packet_loss=0, jitter_ms=0):
+        record = self.history.setdefault(server, {"samples": []})
+        record["samples"].append({
             "latency": latency_ms,
             "success": success,
             "speed": speed_mbps,
             "loss": packet_loss,
+            "jitter": jitter_ms,
             "time": time.time(),
         })
-        old["samples"] = old["samples"][-20:]
+        record["samples"] = record["samples"][-30:]
 
-        samples = old["samples"]
+        samples = record["samples"]
         latency = statistics.mean(x["latency"] for x in samples)
         reliability = sum(1 for x in samples if x["success"]) / len(samples)
         speed = statistics.mean(x["speed"] for x in samples)
         loss = statistics.mean(x["loss"] for x in samples)
+        jitter = statistics.mean(x["jitter"] for x in samples)
 
         if not success:
             return 0
 
         return max(0, (
             reliability * 35
-            + min(speed, 200) * 0.3
-            + max(0, 200 - latency) * 0.15
+            + min(speed, 500) * 0.35
+            + max(0, 250 - latency) * 0.12
             + max(0, 10 - loss) * 2
+            + max(0, 50 - jitter) * 0.2
         ))
 
     def usable(self, server):
@@ -41,7 +44,16 @@ class BenchmarkEngine:
         if not samples:
             return False
         latest = samples[-1]
-        return latest["success"] and latest["latency"] < 250 and latest["speed"] >= 5
+        return (
+            latest["success"]
+            and latest["latency"] <= 220
+            and latest["speed"] >= 10
+            and latest["loss"] <= 5
+        )
 
     def rank(self, servers):
-        return sorted(servers, key=lambda x: x.get("score", 0), reverse=True)
+        return sorted(
+            servers,
+            key=lambda x: x.get("score", 0),
+            reverse=True,
+        )
