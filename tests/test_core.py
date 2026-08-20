@@ -1,5 +1,7 @@
 import base64
 import json
+import socket
+import struct
 import sys
 import tempfile
 import unittest
@@ -140,6 +142,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(profiles), 2)
         self.assertIn("remote 1.1.1.1 443 tcp-client", profiles[0])
         self.assertIn("remote 2.2.2.2 443 tcp-client", profiles[1])
+
+    def test_dns_parser_accepts_standard_four_field_header(self):
+        transaction_id = b"\x12\x34"
+        question = b"\x03www\x07example\x03com\x00\x00\x01\x00\x01"
+        answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"
+        packet = transaction_id + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + question + answer
+        with patch("standalone_engine.socket.socket") as sock_cls:
+            sock = sock_cls.return_value.__enter__.return_value
+            sock.recvfrom.return_value = (packet, ("1.1.1.1", 53))
+            self.assertEqual(standalone_engine._dns_a_records("www.example.com", 0.1), ["1.2.3.4"])
 
     def test_cache_discards_planted_public_vpn_entries(self):
         payload = {
