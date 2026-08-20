@@ -49,7 +49,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("pull-filter ignore \"redirect-gateway\"", text)
             self.assertIn("pull-filter ignore \"redirect-private\"", text)
             self.assertIn("redirect-gateway def1 bypass-dhcp bypass-dns", text)
-            self.assertIn("route-delay 2 30", text)
+            self.assertIn("route-delay 1 8", text)
             self.assertIn("show-net-up", text)
             self.assertIn("disable-dco", text)
             self.assertNotIn("route-nopull", text)
@@ -112,9 +112,6 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(standalone_engine.full_tunnel_routes(both))
 
     def test_full_tunnel_survives_many_duplicate_routes(self):
-        # Windows may expose many duplicate /1 entries. The validation must
-        # not lose one half of the pair merely because it is beyond a tail
-        # slice of the route table output.
         first = "128.0.0.0 128.0.0.0 10.102.192.25 10.102.192.26 5"
         duplicates = [
             f"0.0.0.0 128.0.0.0 10.102.{i}.1 10.102.{i}.2 3"
@@ -122,6 +119,27 @@ class CoreTests(unittest.TestCase):
         ]
         snapshot = " | ".join([first] + duplicates)
         self.assertTrue(standalone_engine.full_tunnel_routes(snapshot))
+
+    def test_vpnbook_expands_four_transport_methods(self):
+        profile = "client\nremote ca149.vpnbook.com 443 tcp-client\nproto tcp\n"
+        with patch.object(standalone_engine, "_BASE_PROFILES", return_value=([profile], "vpnbook", "secret")):
+            server = {"kind": "book", "host": "ca149.vpnbook.com", "id": "book:ca149"}
+            profiles, username, password = standalone_engine._multi_profiles(server)
+        self.assertEqual((username, password), ("vpnbook", "secret"))
+        self.assertEqual(len(profiles), 4)
+        self.assertIn("remote ca149.vpnbook.com 443 tcp-client", profiles[0])
+        self.assertTrue(any("remote ca149.vpnbook.com 80 tcp-client" in p for p in profiles))
+        self.assertTrue(any("remote ca149.vpnbook.com 53 udp" in p for p in profiles))
+        self.assertTrue(any("remote ca149.vpnbook.com 25000 udp" in p for p in profiles))
+
+    def test_vpngate_multiple_remote_endpoints_expand_without_duplicates(self):
+        profile = "client\nremote 1.1.1.1 443 tcp-client\nremote 2.2.2.2 443 tcp-client\n"
+        with patch.object(standalone_engine, "_BASE_PROFILES", return_value=([profile], "vpn", "vpn")):
+            server = {"kind": "gate", "host": "example", "id": "gate:1.1.1.1:example"}
+            profiles, _, _ = standalone_engine._multi_profiles(server)
+        self.assertEqual(len(profiles), 2)
+        self.assertIn("remote 1.1.1.1 443 tcp-client", profiles[0])
+        self.assertIn("remote 2.2.2.2 443 tcp-client", profiles[1])
 
     def test_cache_discards_planted_public_vpn_entries(self):
         payload = {
