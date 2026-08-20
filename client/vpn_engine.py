@@ -256,9 +256,24 @@ def _vpnbook_profiles(server: dict) -> list[str]:
         names = [n for n in archive.namelist() if n.lower().endswith(".ovpn")]
         if not names:
             raise RuntimeError("VPNBook bundle contains no OpenVPN profiles")
-        order = ("tcp443", "tcp80", "udp53", "udp25000")
-        names.sort(key=lambda n: next((i for i, token in enumerate(order) if token in n.lower()), 99))
-        return [archive.read(n).decode("utf-8-sig", "replace") for n in names]
+        method_tokens = (("tcp443", "TCP/443"), ("tcp80", "TCP/80"), ("udp53", "UDP/53"), ("udp25000", "UDP/25000"))
+        selected: list[tuple[str, str]] = []
+        used: set[str] = set()
+        for token, label in method_tokens:
+            candidates = [n for n in names if token in n.lower()]
+            if not candidates:
+                continue
+            candidates.sort(key=lambda n: (len(n), n.lower()))
+            selected.append((label, candidates[0]))
+            used.add(candidates[0])
+        # Keep an unknown-format profile only when the archive does not expose
+        # the standard VPNBook transport names. This prevents 16 duplicate
+        # attempts from burning the whole connection deadline.
+        if not selected:
+            selected = [("PROFILE", n) for n in sorted(names, key=str.lower)[:4]]
+        profiles = [archive.read(name).decode("utf-8-sig", "replace") for _, name in selected]
+        log("VPNBOOK METHODS selected=" + ",".join(label for label, _ in selected))
+        return profiles
 
 
 def _vpnbook_password() -> str:
@@ -313,7 +328,22 @@ def _prepare(profile: str, username: str, password: str, work: Path, openvpn_ver
         lines.append(f"data-ciphers {legacy_cipher}:AES-256-GCM:AES-128-GCM")
     if not any(x.lower().startswith("auth-user-pass") for x in lines):
         lines.append(f"auth-user-pass {_ovpn_path(auth)}")
-    lines.extend(["auth-nocache", "verb 3", "route-method exe", "route-delay 2 10", "route 0.0.0.0 128.0.0.0", "route 128.0.0.0 128.0.0.0"])
+    # Make every transport self-failing instead of hanging after a TCP connect
+    # or TLS handshake. The outer loop then advances to the next transport.
+    lines.extend([
+        "auth-nocache",
+        "verb 3",
+        "route-method exe",
+        "route-delay 2 10",
+        "route 0.0.0.0 128.0.0.0",
+        "route 128.0.0.0 128.0.0.0",
+        "connect-timeout 8",
+        "server-poll-timeout 8",
+        "resolv-retry 3",
+        "ping 10",
+        "ping-restart 30",
+        "tls-timeout 8",
+    ])
     if has_compression:
         lines.append("allow-compression yes")
     config = work / "client.ovpn"
@@ -323,7 +353,7 @@ def _prepare(profile: str, username: str, password: str, work: Path, openvpn_ver
 
 def _classify(text: str, code: int | None) -> str:
     low = text.lower()
-    patterns = (("bad backslash", "OpenVPN configuration contains an invalid Windows backslash path"), ("options error", "OpenVPN configuration error"), ("unknown option", "OpenVPN does not support an option in this profile"), ("auth_failed", "authentication failed"), ("data channel cipher negotiation failed", "server cipher is incompatible"), ("tls error", "TLS handshake failed"), ("connection refused", "connection refused"), ("network is unreachable", "network unreachable"), ("cannot open tun", "TUN/TAP adapter unavailable"), ("all tap-windows adapters", "TUN/TAP adapter unavailable"), ("access is denied", "administrator permission required"), ("route addition failed", "Windows route installation failed"))
+    patterns = (("bad backslash", "OpenVPN configuration contains an invalid Windows backslash path"), ("options error", "OpenVPN configuration error"), ("unknown option", "OpenVPN does not support an option in this profile"), ("auth_failed", "authentication failed"), ("data channel cipher negotiation failed", "server cipher is incompatible"), ("tls error", "TLS handshake failed"), ("connection refused", "connection refused"), ("network is unreachable", "network unreachable"), ("cannot open tun", "TUN/TAP adapter unavailable"), ("all tap-windows adapters", "TUN/TAP adapter unavailable"), ("access is denied", "administrator permission required"), ("route addition failed", "Windows route installation failed"), ("push_request", "server did not complete the OpenVPN control-channel push exchange"))
     for key, message in patterns:
         if key in low:
             return message
@@ -364,7 +394,7 @@ def _write_failure_log(server: dict, text: str) -> None:
     (PROFILE_LOGS / f"{safe}-last-failure.log").write_text(text[-100_000:], encoding="utf-8", errors="replace")
 
 
-def connect(server: dict, total_deadline: float = 35):
+def connect(server: dict, total_deadline: float = 60):
     if not _is_real_server(server):
         raise RuntimeError("Refusing to connect to an invalid or non-discovered server entry")
     exe = openvpn_exe()
@@ -375,6 +405,7 @@ def connect(server: dict, total_deadline: float = 35):
     started = time.monotonic()
     profiles, username, password = _profiles(server)
     last = ""
+    log(f"OPENVPN FALLBACK PLAN server={server['host']} attempts={len(profiles)} per_attempt=12s")
     for index, profile in enumerate(profiles, 1):
         if time.monotonic() - started >= total_deadline:
             break
@@ -393,10 +424,8 @@ def connect(server: dict, total_deadline: float = 35):
                     route_deadline = time.monotonic() + 5
                     while time.monotonic() < route_deadline:
                         snapshot = route_snapshot()
-                        if os.name != "nt" or {p for p in (snapshot or "").split(" | ") if p and p.split()}:
-                            # Let the standalone facade perform the strict both-/1 check.
-                            if os.name != "nt" or ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
-                                break
+                        if os.name != "nt" or ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
+                            break
                         time.sleep(0.25)
                     if os.name == "nt" and not ("0.0.0.0 128.0.0.0" in snapshot and "128.0.0.0 128.0.0.0" in snapshot):
                         last = "OpenVPN connected but both full-tunnel Windows /1 routes were not installed"
@@ -422,14 +451,14 @@ def connect(server: dict, total_deadline: float = 35):
             text = _read_log(logfile)
             if text:
                 last = _classify(text, process.returncode if process else None)
-            log(f"OPENVPN ATTEMPT FAIL server={server['host']} profile={index} reason={last}")
+            log(f"OPENVPN ATTEMPT FAIL server={server['host']} profile={index}/{len(profiles)} reason={last}; trying next method")
             _write_failure_log(server, text or last)
         except Exception as exc:
             last = str(exc)
             text = _read_log(work / "openvpn.log")
             if text:
                 _write_failure_log(server, text)
-            log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} profile={index} error={type(exc).__name__}: {exc}")
+            log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} profile={index}/{len(profiles)} error={type(exc).__name__}: {exc}; trying next method")
         finally:
             if process and process.poll() is None:
                 try:
@@ -437,7 +466,7 @@ def connect(server: dict, total_deadline: float = 35):
                 except Exception:
                     pass
             shutil.rmtree(work, ignore_errors=True)
-    raise RuntimeError(last or "all OpenVPN profiles failed; see the latest OpenVPN failure log")
+    raise RuntimeError(last or "all OpenVPN transport methods failed; see the latest OpenVPN failure log")
 
 
 def public_ip(timeout: float = 8) -> str:
@@ -464,6 +493,6 @@ def verify_tunnel(previous_ip: str | None = None, timeout: float = 8) -> str:
             raise RuntimeError("VPN process connected, but both full-tunnel Windows /1 routes are missing")
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
-        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
-    log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} routes={snapshot or 'non-Windows'}")
+        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
+    log(f"PUBLIC IP VPN url=https://api.ipify.org public_ip={ip}")
     return ip
