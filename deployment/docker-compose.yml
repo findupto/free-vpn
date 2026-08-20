@@ -1,0 +1,10 @@
+services:
+  vpn-control-plane:
+    build: ..
+    restart: always
+    environment:
+      - ENV=production
+
+  monitoring:
+    image: prom/prometheus
+    restart: always
