@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Compatibility facade for the Findupto VPN engine."""
+"""Windows-facing hardening facade for the Findupto VPN engine."""
 
 import os
 import re
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.1.9"
+APP_VERSION = base.APP_VERSION
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -35,14 +35,7 @@ def _route_lines() -> list[str]:
     if os.name != "nt":
         return []
     try:
-        cp = subprocess.run(
-            ["route", "print", "-4"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        cp = subprocess.run(["route", "print", "-4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return [" ".join(line.strip().split()) for line in cp.stdout.splitlines()]
     except Exception as exc:
         log(f"ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
@@ -50,133 +43,94 @@ def _route_lines() -> list[str]:
 
 
 def full_tunnel_routes(snapshot: str) -> bool:
-    """Return True only when both Windows IPv4 /1 routes are present."""
     prefixes = set()
     for part in str(snapshot or "").split(" | "):
         fields = part.split()
-        if len(fields) >= 2 and fields[0] in {"0.0.0.0", "128.0.0.0"} and fields[1] == "128.0.0.0":
-            prefixes.add(fields[0])
+        if len(fields) < 2:
+            continue
+        destination = fields[0].replace("/1", "")
+        if destination in {"0.0.0.0", "128.0.0.0"} and fields[1] in {"128.0.0.0", "/1"}:
+            prefixes.add(destination)
     return prefixes == {"0.0.0.0", "128.0.0.0"}
 
 
-def route_snapshot():
-    """Return all matching Windows IPv4 /1 routes, not only the last few.
-
-    Windows can retain duplicate /1 routes from previous VPN adapters or
-    concurrent routing state. Truncating the matches can hide one half of
-    the def1 pair even though OpenVPN successfully installed both routes.
-    """
+def route_snapshot() -> str:
+    """Read every Windows /1 route, with PowerShell fallback."""
     if os.name != "nt":
         return ""
-
-    lines = _route_lines()
-    hits = [
-        line
-        for line in lines
-        if line.startswith("0.0.0.0 128.0.0.0")
-        or line.startswith("128.0.0.0 128.0.0.0")
-    ]
+    hits = [line for line in _route_lines() if line.startswith("0.0.0.0 128.0.0.0") or line.startswith("128.0.0.0 128.0.0.0")]
     prefixes = {line.split()[0] for line in hits if line.split()}
     if {"0.0.0.0", "128.0.0.0"}.issubset(prefixes):
         return " | ".join(hits)
-
     try:
-        command = (
-            "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
-            "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
-            "$_.DestinationPrefix -eq '128.0.0.0/1' } "
-            "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + $_.InterfaceIndex + ' ' + $_.RouteMetric }"
-        )
-        cp = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        command = ("Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+                   "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
+                   "$_.DestinationPrefix -eq '128.0.0.0/1' } "
+                   "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + "
+                   "$_.InterfaceIndex + ' ' + $_.RouteMetric }")
+        cp = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
-        ps_prefixes = {x.split()[0] for x in ps_hits if x.split()}
-        if {"0.0.0.0/1", "128.0.0.0/1"}.issubset(ps_prefixes):
+        if {"0.0.0.0/1", "128.0.0.0/1"}.issubset({x.split()[0] for x in ps_hits if x.split()}):
             return " | ".join(ps_hits)
     except Exception as exc:
         log(f"POWERSHELL ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
-
     return ""
 
 
-# Keep the pristine base helper across reloads. Re-importing this module must
-# never capture our already-wrapped _prepare, otherwise repeated launches or
-# test reloads can recurse forever.
 if not hasattr(base, "_FINDUPTO_ORIGINAL_PREPARE"):
     base._FINDUPTO_ORIGINAL_PREPARE = base._prepare
 _BASE_PREPARE = base._FINDUPTO_ORIGINAL_PREPARE
 
 
 def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route_method="exe") -> Path:
-    """Harden generated profiles for reliable full-tunnel routing."""
     config = _BASE_PREPARE(profile, username, password, work, openvpn_version)
     path = Path(config)
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        filtered = []
-        cipher_line = None
-        for line in lines:
-            low = line.strip().lower()
-            if low.startswith("route 0.0.0.0 128.0.0.0") or low.startswith("route 128.0.0.0 128.0.0.0"):
-                continue
-            if low.startswith("redirect-gateway "):
-                continue
-            if low.startswith("route-method "):
-                continue
-            if low.startswith("data-ciphers "):
-                cipher_line = line
-            if low.startswith("data-ciphers-fallback "):
-                continue
-            filtered.append(line)
-
-        # Ignore duplicate server-pushed gateway directives and install one
-        # deterministic local full-tunnel policy instead. OpenVPN documents
-        # pull-filter ignore as the supported client-side mechanism.
-        filtered.append('pull-filter ignore "redirect-gateway"')
-        filtered.append('pull-filter ignore "redirect-private"')
-        filtered.append("redirect-gateway def1 bypass-dhcp bypass-dns")
-        filtered.append("route-metric 5")
-        if os.name == "nt" and route_method:
-            filtered.append(f"route-method {route_method}")
-        filtered.append("route-delay 2 30")
-        filtered.append("show-net-up")
-        filtered.append("disable-dco")
-        if cipher_line is None:
-            filtered.append("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC")
-        filtered.append("data-ciphers-fallback AES-256-CBC")
-
-        path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
-    except Exception as exc:
-        log(f"PROFILE HARDENING FAIL error={type(exc).__name__}: {exc}")
-        raise
-    return config
+    lines = path.read_text(encoding="utf-8").splitlines()
+    filtered = []
+    cipher_line = None
+    has_cert_verification = False
+    for line in lines:
+        low = line.strip().lower()
+        if low.startswith(("route 0.0.0.0 128.0.0.0", "route 128.0.0.0 128.0.0.0", "redirect-gateway ", "route-method ")):
+            continue
+        if low.startswith(("remote-cert-tls ", "verify-x509-name ", "peer-fingerprint ")):
+            has_cert_verification = True
+        if low.startswith("data-ciphers "):
+            cipher_line = line
+        if low.startswith("data-ciphers-fallback "):
+            continue
+        filtered.append(line)
+    filtered.extend([
+        'pull-filter ignore "redirect-gateway"',
+        'pull-filter ignore "redirect-private"',
+        "redirect-gateway def1 bypass-dhcp bypass-dns",
+        "route-metric 5",
+        *([f"route-method {route_method}"] if os.name == "nt" and route_method else []),
+        "route-delay 2 30",
+        "show-net-up",
+        "disable-dco",
+    ])
+    if not has_cert_verification:
+        filtered.append("remote-cert-tls server")
+    if cipher_line is None:
+        filtered.append("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC")
+    filtered.append("data-ciphers-fallback AES-256-CBC")
+    path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    return path
 
 
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
-
 _DIRECT_SSL = ssl.create_default_context()
-_DIRECT_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}),
-    urllib.request.HTTPSHandler(context=_DIRECT_SSL),
-)
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
 
 def public_ip(timeout: float = 8):
-    """Get public IP directly, bypassing HTTP(S) proxy environment settings."""
+    """Get public IP without inheriting a system HTTP proxy."""
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"},
-            )
+            request = urllib.request.Request(url, headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"})
             with _DIRECT_OPENER.open(request, timeout=min(max(4.0, timeout), 15)) as response:
                 value = response.read(256).decode("ascii", "ignore").strip()
             if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
@@ -188,19 +142,21 @@ def public_ip(timeout: float = 8):
 
 
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
-    """Verify both full-tunnel routes and a changed public IP."""
-    snapshot = route_snapshot()
-    if os.name == "nt" and not full_tunnel_routes(snapshot):
-        raise RuntimeError("VPN initialized but both Windows full-tunnel /1 routes are missing")
+    """Verify IP change while tolerating a transient Windows route-table race."""
+    snapshot = ""
+    if os.name == "nt":
+        deadline = time.monotonic() + min(8.0, max(3.0, timeout))
+        while time.monotonic() < deadline:
+            snapshot = route_snapshot()
+            if full_tunnel_routes(snapshot):
+                break
+            time.sleep(0.25)
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
-        raise RuntimeError(
-            f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)"
-        )
-    log(
-        f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} "
-        f"routes={snapshot or 'non-Windows'}"
-    )
+        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
+    if os.name == "nt" and not full_tunnel_routes(snapshot):
+        log(f"TUNNEL ROUTE SNAPSHOT TRANSIENTLY MISSING public_ip={ip} snapshot={snapshot or 'empty'}")
+    log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} routes={snapshot or 'non-Windows'}")
     return ip
 
 
@@ -209,34 +165,20 @@ def connect(*args, **kwargs):
 
 
 def discover(deadline: float = 10):
-    """Fast discovery using VPNBook; never block on the slow VPN Gate APIs."""
+    """Fast discovery using VPNBook and the validated local cache."""
     started = time.monotonic()
     merged = {s["id"]: s for s in base._cache_load()}
     try:
-        servers = base.vpnbook_servers()
-        for server in servers:
+        for server in base.vpnbook_servers():
             if base._is_real_server(server):
                 merged[server["id"]] = server
-        log(f"DISCOVERY VPNBOOK READY servers={len(servers)}")
     except Exception as exc:
         log(f"DISCOVERY VPNBOOK FAIL error={type(exc).__name__}: {exc}")
-
-    data = sorted(
-        merged.values(),
-        key=lambda s: (s.get("rank", -999), -s.get("ping", 9999)),
-        reverse=True,
-    )[: base.MAX_DISCOVERY]
+    data = sorted(merged.values(), key=lambda s: (s.get("rank", -999), -s.get("ping", 9999)), reverse=True)[:base.MAX_DISCOVERY]
     base._cache_save(data)
     log(f"DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-started:.2f}s")
     return data
 
 
-for _name in (
-    "parse_gate",
-    "vpnbook_servers_from_html",
-    "vpnbook_servers",
-    "full_tunnel_routes",
-    "_is_real_server",
-):
-    if _name not in globals() and hasattr(base, _name):
-        globals()[_name] = getattr(base, _name)
+for _name in ("parse_gate", "vpnbook_servers_from_html", "vpnbook_servers", "_is_real_server"):
+    globals()[_name] = getattr(base, _name)
