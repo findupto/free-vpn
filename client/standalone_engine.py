@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from pathlib import Path
 
 import vpn_engine as base
 
@@ -46,52 +47,83 @@ def _route_lines() -> list[str]:
 
 
 def route_snapshot():
-    """Find OpenVPN /1 routes without depending on localized column spacing."""
+    """Return a snapshot only when BOTH Windows IPv4 /1 routes exist."""
+    if os.name != "nt":
+        return ""
+
     lines = _route_lines()
     hits = [
         line for line in lines
         if line.startswith("0.0.0.0 128.0.0.0")
         or line.startswith("128.0.0.0 128.0.0.0")
     ]
-    if hits:
+    if len({line.split()[0] for line in hits}) >= 2:
         return " | ".join(hits[-8:])
 
-    if os.name == "nt":
-        try:
-            command = (
-                "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
-                "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
-                "$_.DestinationPrefix -eq '128.0.0.0/1' } "
-                "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + $_.InterfaceIndex }"
-            )
-            cp = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
-            if ps_hits:
-                return " | ".join(ps_hits[-8:])
-        except Exception as exc:
-            log(f"POWERSHELL ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
+    # route.exe can occasionally omit entries while PowerShell still exposes
+    # the active route objects. Do not accept a generic initialization marker:
+    # verification must prove that both halves of the IPv4 address space are
+    # actually routed through the tunnel.
+    try:
+        command = (
+            "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
+            "$_.DestinationPrefix -eq '128.0.0.0/1' } "
+            "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + $_.InterfaceIndex }"
+        )
+        cp = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
+        prefixes = set(x.split()[0] for x in ps_hits if x.split())
+        if {"0.0.0.0/1", "128.0.0.0/1"}.issubset(prefixes):
+            return " | ".join(ps_hits[-8:])
+    except Exception as exc:
+        log(f"POWERSHELL ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
 
-    # OpenVPN has already reported Initialization Sequence Completed at this
-    # point. Windows can occasionally hide the /1 routes from both route.exe
-    # and Get-NetRoute. Returning a non-empty marker lets the subsequent public
-    # IP verification decide whether traffic really crossed the VPN.
-    return "OpenVPN initialized; Windows route table unavailable"
+    return ""
 
 
-# base.connect() resolves route_snapshot in vpn_engine's own global namespace.
+def _prepare(*args, **kwargs):
+    """Harden generated profiles with OpenVPN's native def1 full-tunnel mode."""
+    config = base._prepare(*args, **kwargs)
+    try:
+        path = Path(config)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        filtered = []
+        for line in lines:
+            low = line.strip().lower()
+            if low.startswith("route 0.0.0.0 128.0.0.0") or low.startswith("route 128.0.0.0 128.0.0.0"):
+                continue
+            if low.startswith("redirect-gateway "):
+                continue
+            filtered.append(line)
+        # def1 asks OpenVPN to install both 0/1 and 128/1 while preserving a
+        # host route to the VPN server. This is more reliable on Windows than
+        # manually adding the two routes after stripping redirect-gateway.
+        filtered.append("redirect-gateway def1")
+        path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log(f"PROFILE HARDENING FAIL error={type(exc).__name__}: {exc}")
+        raise
+    return config
+
+
+# base.connect() resolves these helpers in vpn_engine's own global namespace.
 base.route_snapshot = route_snapshot
+base._prepare = _prepare
 
 
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
-    """Verify traffic by checking the public IP after OpenVPN initialization."""
+    """Verify both full-tunnel routes and a changed public IP."""
     snapshot = route_snapshot()
+    if os.name == "nt" and not snapshot:
+        raise RuntimeError("VPN initialized but both Windows full-tunnel /1 routes are missing")
     ip = base.public_ip(timeout)
     if previous_ip and ip == previous_ip:
         raise RuntimeError(
@@ -99,7 +131,7 @@ def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
         )
     log(
         f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} "
-        f"routes={snapshot}"
+        f"routes={snapshot or 'non-Windows'}"
     )
     return ip
 
@@ -129,10 +161,6 @@ def discover(deadline: float = 10):
     base._cache_save(data)
     log(f"DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-started:.2f}s")
     return data
-
-
-def _prepare(*args, **kwargs):
-    return base._prepare(*args, **kwargs)
 
 
 # Export optional API names without eager getattr() evaluation.
