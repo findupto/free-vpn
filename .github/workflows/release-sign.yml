@@ -1,0 +1,13 @@
+name: Signed Release
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify build
+        run: echo "signed release pipeline foundation"
