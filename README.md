@@ -1,19 +1,21 @@
 # Findupto VPN
 
-A lightweight desktop VPN client that discovers live public OpenVPN servers, ranks them, retries multiple profiles and servers, and refuses to report success until the tunnel is actually usable.
+A lightweight desktop VPN client that discovers live public OpenVPN servers, ranks them, uses multiple transport methods and server endpoints, retries intelligently, and refuses to report success until the tunnel is actually usable.
 
-## v13.1.9
+## v13.2.0
 
-This release fixes the Windows connection failures shown by recent diagnostics:
+This release upgrades the Windows connection engine with fast multi-method failover:
 
-- OpenVPN profile preparation is reload-safe; repeated module imports can no longer recurse through the `_prepare` wrapper;
-- Windows full-tunnel validation now requires **both** `0.0.0.0/1` and `128.0.0.0/1` routes before a tunnel is considered initialized;
-- generated Windows profiles use OpenVPN `redirect-gateway def1` with route metric and route delay settings instead of relying on a single pushed `/1` route;
-- OpenVPN DCO is explicitly disabled for public/community profiles;
-- legacy CBC profiles retain explicit `data-ciphers` and `data-ciphers-fallback` compatibility;
-- public-IP verification bypasses configured HTTP(S) proxies so the verification request follows the machine's actual routing table;
-- the application, standalone engine, and core engine versions are synchronized at 13.1.9;
-- the existing strict rule remains: a connection is successful only when the tunnel is initialized, the Windows full-tunnel routes are installed, and the public IP changes.
+- VPNBook automatically tries **TCP/443, TCP/80, UDP/53 and UDP/25000** when available;
+- VPN Gate profiles with multiple `remote` endpoints are expanded into independent fallback attempts;
+- dead transports fail fast instead of waiting through long OpenVPN retries;
+- each candidate server is capped at a short connection budget so one dead server cannot monopolize the queue;
+- successful OpenVPN work directories are retained until disconnect, fixing cleanup of the live auth/config/log files;
+- failed attempts are terminated and cleaned immediately;
+- Windows full-tunnel validation requires both `0.0.0.0/1` and `128.0.0.0/1` routes;
+- public-IP verification bypasses configured HTTP(S) proxies and requires an actual IP change;
+- DCO is disabled for public/community profiles and legacy CBC cipher compatibility is retained;
+- the existing strict success rule remains: initialization + full-tunnel routes + changed public IP.
 
 ## Supported platforms
 
