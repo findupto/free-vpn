@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "13.1.9"
+VERSION = "13.2.0"
 
 
 def _is_admin() -> bool:
