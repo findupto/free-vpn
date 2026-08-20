@@ -111,6 +111,18 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(standalone_engine.full_tunnel_routes(one))
         self.assertTrue(standalone_engine.full_tunnel_routes(both))
 
+    def test_full_tunnel_survives_many_duplicate_routes(self):
+        # Windows may expose many duplicate /1 entries. The validation must
+        # not lose one half of the pair merely because it is beyond a tail
+        # slice of the route table output.
+        first = "128.0.0.0 128.0.0.0 10.102.192.25 10.102.192.26 5"
+        duplicates = [
+            f"0.0.0.0 128.0.0.0 10.102.{i}.1 10.102.{i}.2 3"
+            for i in range(10)
+        ]
+        snapshot = " | ".join([first] + duplicates)
+        self.assertTrue(standalone_engine.full_tunnel_routes(snapshot))
+
     def test_cache_discards_planted_public_vpn_entries(self):
         payload = {
             "time": 4102444800,
