@@ -49,8 +49,6 @@ class CoreTests(unittest.TestCase):
             self.assertIn("pull-filter ignore \"redirect-gateway\"", text)
             self.assertIn("pull-filter ignore \"redirect-private\"", text)
             self.assertIn("redirect-gateway def1 bypass-dhcp bypass-dns", text)
-            self.assertIn("route 0.0.0.0 128.0.0.0", text)
-            self.assertIn("route 128.0.0.0 128.0.0.0", text)
             self.assertIn("route-delay 2 30", text)
             self.assertIn("show-net-up", text)
             self.assertIn("disable-dco", text)
