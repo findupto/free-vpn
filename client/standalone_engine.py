@@ -12,7 +12,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.1.6"
+APP_VERSION = "13.1.7"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -88,10 +88,8 @@ def route_snapshot():
     return ""
 
 
-# Keep the original implementation before replacing the helper used by
-# base.connect(). The previous version assigned base._prepare = _prepare and
-# then called base._prepare() from _prepare(), causing immediate infinite
-# recursion and hiding the actual OpenVPN result.
+# Preserve the original helper before overriding the global used by
+# base.connect(). This prevents the recursive base._prepare = _prepare bug.
 _BASE_PREPARE = base._prepare
 
 
@@ -122,21 +120,22 @@ base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
 
-def public_ip(timeout: float = 8):
-    """Get the public IP without inherited HTTP proxies.
+_DIRECT_SSL = ssl.create_default_context()
+_DIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=_DIRECT_SSL),
+)
 
-    Verification must observe the host's real routing table. A configured
-    HTTP(S)_PROXY can make ipify report the same proxy IP even when OpenVPN
-    has correctly installed the full-tunnel routes.
-    """
+
+def public_ip(timeout: float = 8):
+    """Get public IP directly, bypassing HTTP(S) proxy environment settings."""
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
             request = urllib.request.Request(
                 url,
                 headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"},
             )
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=min(max(4.0, timeout), 15), context=ssl.create_default_context()) as response:
+            with _DIRECT_OPENER.open(request, timeout=min(max(4.0, timeout), 15)) as response:
                 value = response.read(256).decode("ascii", "ignore").strip()
             if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
                 log(f"PUBLIC IP DIRECT url={url} public_ip={value}")
@@ -190,7 +189,6 @@ def discover(deadline: float = 10):
     return data
 
 
-# Export optional API names without eager getattr() evaluation.
 for _name in (
     "parse_gate",
     "vpnbook_servers_from_html",
