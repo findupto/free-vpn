@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-"""Windows-facing hardening facade for the Findupto VPN engine."""
+"""Windows-facing hardening and fast-fail connection facade."""
 
 import os
 import re
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = base.APP_VERSION
+APP_VERSION = "13.2.0"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -35,7 +36,7 @@ def _route_lines() -> list[str]:
     if os.name != "nt":
         return []
     try:
-        cp = subprocess.run(["route", "print", "-4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cp = subprocess.run(["route", "print", "-4"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return [" ".join(line.strip().split()) for line in cp.stdout.splitlines()]
     except Exception as exc:
         log(f"ROUTE SNAPSHOT FAIL error={type(exc).__name__}: {exc}")
@@ -55,7 +56,7 @@ def full_tunnel_routes(snapshot: str) -> bool:
 
 
 def route_snapshot() -> str:
-    """Read every Windows /1 route, with PowerShell fallback."""
+    """Read Windows /1 routes with a PowerShell fallback."""
     if os.name != "nt":
         return ""
     hits = [line for line in _route_lines() if line.startswith("0.0.0.0 128.0.0.0") or line.startswith("128.0.0.0 128.0.0.0")]
@@ -63,12 +64,14 @@ def route_snapshot() -> str:
     if {"0.0.0.0", "128.0.0.0"}.issubset(prefixes):
         return " | ".join(hits)
     try:
-        command = ("Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
-                   "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
-                   "$_.DestinationPrefix -eq '128.0.0.0/1' } "
-                   "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + "
-                   "$_.InterfaceIndex + ' ' + $_.RouteMetric }")
-        cp = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        command = (
+            "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.DestinationPrefix -eq '0.0.0.0/1' -or "
+            "$_.DestinationPrefix -eq '128.0.0.0/1' } "
+            "| ForEach-Object { $_.DestinationPrefix + ' ' + $_.NextHop + ' ' + "
+            "$_.InterfaceIndex + ' ' + $_.RouteMetric }"
+        )
+        cp = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         ps_hits = [" ".join(x.strip().split()) for x in cp.stdout.splitlines() if "/1" in x]
         if {"0.0.0.0/1", "128.0.0.0/1"}.issubset({x.split()[0] for x in ps_hits if x.split()}):
             return " | ".join(ps_hits)
@@ -106,7 +109,7 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
         "redirect-gateway def1 bypass-dhcp bypass-dns",
         "route-metric 1",
         *([f"route-method {route_method}"] if os.name == "nt" and route_method else []),
-        "route-delay 2 30",
+        "route-delay 1 8",
         "show-net-up",
         "disable-dco",
     ])
@@ -122,10 +125,6 @@ def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
-
-# Keep the original profile loader, then expand VPNBook into explicit transport
-# fallbacks. This matters when the live bundle is missing one of the usual
-# profiles: we still try TCP/443, TCP/80, UDP/53 and UDP/25000 ourselves.
 _BASE_PROFILES = base._profiles
 _VPNBOOK_METHODS = (
     ("tcp", "443", "tcp-client"),
@@ -156,69 +155,202 @@ def _vpnbook_method_variants(profile: str) -> list[str]:
     return variants or [profile]
 
 
+def _gate_variants(profile: str) -> list[str]:
+    """Create one profile per remote endpoint while preserving all other settings."""
+    lines = profile.splitlines()
+    remotes = [i for i, line in enumerate(lines) if line.strip().lower().startswith("remote ")]
+    if len(remotes) <= 1:
+        return [profile]
+    variants = []
+    for selected in remotes:
+        variant = []
+        for i, line in enumerate(lines):
+            if i in remotes and i != selected:
+                continue
+            variant.append(line)
+        variants.append("\n".join(variant))
+    return variants
+
+
 def _multi_profiles(server: dict) -> tuple[list[str], str, str]:
     profiles, username, password = _BASE_PROFILES(server)
-    if server.get("kind") != "book":
-        return profiles, username, password
     expanded = []
     seen = set()
     for profile in profiles:
-        for variant in _vpnbook_method_variants(profile):
+        variants = _vpnbook_method_variants(profile) if server.get("kind") == "book" else _gate_variants(profile)
+        for variant in variants:
             key = variant.strip()
             if key and key not in seen:
                 seen.add(key)
                 expanded.append(variant)
-    log(f"VPNBOOK METHODS expanded={len(expanded)} methods=TCP/443,TCP/80,UDP/53,UDP/25000")
+    if server.get("kind") == "book":
+        log(f"VPNBOOK METHODS expanded={len(expanded)} methods=TCP/443,TCP/80,UDP/53,UDP/25000")
+    else:
+        log(f"VPNGATE REMOTE FALLBACK variants={len(expanded)}")
     return expanded, username, password
 
 
 base._profiles = _multi_profiles
-
 
 _DIRECT_SSL = ssl.create_default_context()
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
 
 def public_ip(timeout: float = 8):
-    """Get public IP without inheriting a system HTTP proxy."""
+    """Get public IP directly, bypassing configured HTTP proxies."""
+    errors = []
     for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"})
-            with _DIRECT_OPENER.open(request, timeout=min(max(4.0, timeout), 15)) as response:
+            with _DIRECT_OPENER.open(request, timeout=min(max(3.0, timeout), 10)) as response:
                 value = response.read(256).decode("ascii", "ignore").strip()
             if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
                 log(f"PUBLIC IP DIRECT url={url} public_ip={value}")
                 return value
         except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
             log(f"PUBLIC IP DIRECT FAIL url={url} error={type(exc).__name__}: {exc}")
-    raise RuntimeError("Unable to determine public IP without proxy")
+    raise RuntimeError("Unable to determine public IP without proxy: " + " | ".join(errors[-2:]))
 
 
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
-    """Verify IP change while tolerating a transient Windows route-table race."""
     snapshot = ""
     if os.name == "nt":
-        deadline = time.monotonic() + min(8.0, max(3.0, timeout))
+        deadline = time.monotonic() + min(6.0, max(2.0, timeout))
         while time.monotonic() < deadline:
             snapshot = route_snapshot()
             if full_tunnel_routes(snapshot):
                 break
-            time.sleep(0.25)
+            time.sleep(0.2)
+        if not full_tunnel_routes(snapshot):
+            raise RuntimeError("VPN process connected, but both full-tunnel Windows /1 routes are missing")
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
-        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)")
-    if os.name == "nt" and not full_tunnel_routes(snapshot):
-        log(f"TUNNEL ROUTE SNAPSHOT TRANSIENTLY MISSING public_ip={ip} snapshot={snapshot or 'empty'}")
+        raise RuntimeError(f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN")
     log(f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} routes={snapshot or 'non-Windows'}")
     return ip
 
 
+def _read_log(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _kill(process, timeout=2.0):
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=timeout)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=1)
+        except Exception:
+            pass
+
+
+def _attempt_timeout(profile: str) -> float:
+    """Short timeout for dead transports, slightly longer for TLS/auth startup."""
+    low = profile.lower()
+    if "proto udp" in low:
+        return 8.0
+    if "remote " in low:
+        return 9.0
+    return 8.0
+
+
+def _fast_connect(server: dict, total_deadline: float):
+    if not base._is_real_server(server):
+        raise RuntimeError("invalid server entry")
+    exe = openvpn_exe()
+    if not exe:
+        raise RuntimeError("OpenVPN Community is not installed")
+    version = base._openvpn_version(exe)
+    started = time.monotonic()
+    profiles, username, password = base._profiles(server)
+    log(f"FAST FAILOVER PLAN server={server['host']} attempts={len(profiles)} deadline={total_deadline:.1f}s")
+    last = "all connection methods failed"
+    for index, profile in enumerate(profiles, 1):
+        remaining = total_deadline - (time.monotonic() - started)
+        if remaining <= 0.2:
+            break
+        work = Path(tempfile.mkdtemp(prefix="findupto-vpn-"))
+        process = None
+        logfile = work / "openvpn.log"
+        try:
+            config = _prepare(profile, username, password, work, version)
+            timeout = min(_attempt_timeout(profile), max(2.0, remaining - 0.5))
+            process = subprocess.Popen(
+                [exe, "--config", str(config), "--log", str(logfile)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            log(f"OPENVPN START server={server['host']} profile={index}/{len(profiles)} pid={process.pid} timeout={timeout:.1f}s")
+            deadline = time.monotonic() + timeout
+            initialized = False
+            while time.monotonic() < deadline:
+                text = _read_log(logfile)
+                if "Initialization Sequence Completed" in text:
+                    initialized = True
+                    break
+                if process.poll() is not None:
+                    last = base._classify(text, process.returncode)
+                    break
+                time.sleep(0.15)
+            if not initialized:
+                if process.poll() is None:
+                    last = "transport startup timeout"
+                text = _read_log(logfile)
+                if text:
+                    classified = base._classify(text, process.returncode if process.poll() is not None else None)
+                    if classified != "connection timeout":
+                        last = classified
+                log(f"OPENVPN ATTEMPT FAIL server={server['host']} profile={index}/{len(profiles)} reason={last}; trying next method")
+                _kill(process)
+                process = None
+                shutil_rmtree = getattr(__import__('shutil'), 'rmtree')
+                shutil_rmtree(work, ignore_errors=True)
+                continue
+            snapshot = route_snapshot()
+            if os.name == "nt" and not full_tunnel_routes(snapshot):
+                route_deadline = time.monotonic() + min(3.0, max(1.0, deadline - time.monotonic()))
+                while time.monotonic() < route_deadline and not full_tunnel_routes(snapshot):
+                    time.sleep(0.15)
+                    snapshot = route_snapshot()
+                if not full_tunnel_routes(snapshot):
+                    raise RuntimeError("initialization completed but full-tunnel routes were not installed")
+            log(f"OPENVPN INITIALIZED server={server['host']} profile={index} routes={snapshot or 'non-Windows'}")
+            return process, work, logfile
+        except Exception as exc:
+            last = str(exc)
+            text = _read_log(logfile)
+            if text:
+                base._write_failure_log(server, text)
+            log(f"OPENVPN ATTEMPT EXCEPTION server={server['host']} profile={index}/{len(profiles)} error={type(exc).__name__}: {exc}; trying next method")
+            _kill(process)
+            process = None
+            import shutil
+            shutil.rmtree(work, ignore_errors=True)
+        finally:
+            # Successful attempts deliberately keep work/auth/config alive until disconnect.
+            if process is None:
+                import shutil
+                shutil.rmtree(work, ignore_errors=True)
+    raise RuntimeError(last)
+
+
 def connect(server, total_deadline: float = 60):
-    return base.connect(server, total_deadline=total_deadline)
+    # GUI historically supplied 45s per server. Cap it so a dead public server
+    # cannot monopolize the entire candidate queue.
+    return _fast_connect(server, min(float(total_deadline), 30.0))
 
 
 def discover(deadline: float = 10):
-    """Discover both VPN Gate and VPNBook so a broken VPNBook POP cannot block fallback."""
     return base.discover(deadline)
 
 
