@@ -12,7 +12,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.1.8"
+APP_VERSION = "13.1.9"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -51,8 +51,6 @@ def _route_lines() -> list[str]:
 
 def full_tunnel_routes(snapshot: str) -> bool:
     """Return True only when both Windows IPv4 /1 routes are present."""
-    if os.name != "nt":
-        return True
     prefixes = set()
     for part in str(snapshot or "").split(" | "):
         fields = part.split()
@@ -68,7 +66,8 @@ def route_snapshot():
 
     lines = _route_lines()
     hits = [
-        line for line in lines
+        line
+        for line in lines
         if line.startswith("0.0.0.0 128.0.0.0")
         or line.startswith("128.0.0.0 128.0.0.0")
     ]
@@ -116,7 +115,7 @@ def _prepare(*args, **kwargs):
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
         filtered = []
-        has_cipher = False
+        cipher_line = None
         for line in lines:
             low = line.strip().lower()
             if low.startswith("route 0.0.0.0 128.0.0.0") or low.startswith("route 128.0.0.0 128.0.0.0"):
@@ -124,20 +123,20 @@ def _prepare(*args, **kwargs):
             if low.startswith("redirect-gateway "):
                 continue
             if low.startswith("data-ciphers "):
-                has_cipher = True
+                cipher_line = line
+            if low.startswith("data-ciphers-fallback "):
+                continue
             filtered.append(line)
 
-        # Prefer OpenVPN's native def1 routing. It creates both /1 routes and
-        # avoids relying on a server-pushed redirect-gateway directive.
         filtered.append("redirect-gateway def1 bypass-dhcp bypass-dns")
         filtered.append("route-metric 5")
         filtered.append("route-method exe")
         filtered.append("route-delay 2 30")
         filtered.append("show-net-up")
         filtered.append("disable-dco")
-        if not has_cipher:
+        if cipher_line is None:
             filtered.append("data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC")
-            filtered.append("data-ciphers-fallback AES-256-CBC")
+        filtered.append("data-ciphers-fallback AES-256-CBC")
 
         path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
     except Exception as exc:
@@ -146,7 +145,6 @@ def _prepare(*args, **kwargs):
     return config
 
 
-# base.connect() resolves helpers in vpn_engine's own global namespace.
 base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
@@ -184,7 +182,7 @@ def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
     ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
         raise RuntimeError(
-            f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN"
+            f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN)"
         )
     log(
         f"TUNNEL VERIFIED public_ip={ip} previous_ip={previous_ip or 'unknown'} "
