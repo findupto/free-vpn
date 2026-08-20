@@ -4,6 +4,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -231,7 +232,7 @@ class App(tk.Tk):
         try:
             if os.name == "nt":
                 os.startfile(path)
-            elif sys_platform := __import__("sys").platform == "darwin":
+            elif sys.platform == "darwin":
                 subprocess.Popen(["open", path])
             else:
                 subprocess.Popen(["xdg-open", path])
