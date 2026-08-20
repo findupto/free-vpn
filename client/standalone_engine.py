@@ -82,7 +82,7 @@ if not hasattr(base, "_FINDUPTO_ORIGINAL_PREPARE"):
 _BASE_PREPARE = base._FINDUPTO_ORIGINAL_PREPARE
 
 
-def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route_method="exe") -> Path:
+def _prepare(profile, username, password, work, openvpn_version=(0, 0, 0), route_method="adaptive") -> Path:
     config = _BASE_PREPARE(profile, username, password, work, openvpn_version)
     path = Path(config)
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -166,19 +166,8 @@ def connect(*args, **kwargs):
 
 
 def discover(deadline: float = 10):
-    """Fast discovery using VPNBook and the validated local cache."""
-    started = time.monotonic()
-    merged = {s["id"]: s for s in base._cache_load()}
-    try:
-        for server in base.vpnbook_servers():
-            if base._is_real_server(server):
-                merged[server["id"]] = server
-    except Exception as exc:
-        log(f"DISCOVERY VPNBOOK FAIL error={type(exc).__name__}: {exc}")
-    data = sorted(merged.values(), key=lambda s: (s.get("rank", -999), -s.get("ping", 9999)), reverse=True)[:base.MAX_DISCOVERY]
-    base._cache_save(data)
-    log(f"DISCOVERY READY candidates={len(data)} elapsed={time.monotonic()-started:.2f}s")
-    return data
+    """Discover both VPN Gate and VPNBook so a broken VPNBook POP cannot block fallback."""
+    return base.discover(deadline)
 
 
 for _name in ("parse_gate", "vpnbook_servers_from_html", "vpnbook_servers", "_is_real_server"):
