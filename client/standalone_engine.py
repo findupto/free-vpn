@@ -3,13 +3,16 @@ from __future__ import annotations
 """Compatibility facade for the Findupto VPN engine."""
 
 import os
+import re
+import ssl
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = getattr(base, "APP_VERSION", "13.1.5")
+APP_VERSION = "13.1.6"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -60,10 +63,6 @@ def route_snapshot():
     if len({line.split()[0] for line in hits}) >= 2:
         return " | ".join(hits[-8:])
 
-    # route.exe can occasionally omit entries while PowerShell still exposes
-    # the active route objects. Do not accept a generic initialization marker:
-    # verification must prove that both halves of the IPv4 address space are
-    # actually routed through the tunnel.
     try:
         command = (
             "Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue "
@@ -89,9 +88,16 @@ def route_snapshot():
     return ""
 
 
+# Keep the original implementation before replacing the helper used by
+# base.connect(). The previous version assigned base._prepare = _prepare and
+# then called base._prepare() from _prepare(), causing immediate infinite
+# recursion and hiding the actual OpenVPN result.
+_BASE_PREPARE = base._prepare
+
+
 def _prepare(*args, **kwargs):
     """Harden generated profiles with OpenVPN's native def1 full-tunnel mode."""
-    config = base._prepare(*args, **kwargs)
+    config = _BASE_PREPARE(*args, **kwargs)
     try:
         path = Path(config)
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -103,9 +109,6 @@ def _prepare(*args, **kwargs):
             if low.startswith("redirect-gateway "):
                 continue
             filtered.append(line)
-        # def1 asks OpenVPN to install both 0/1 and 128/1 while preserving a
-        # host route to the VPN server. This is more reliable on Windows than
-        # manually adding the two routes after stripping redirect-gateway.
         filtered.append("redirect-gateway def1")
         path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
     except Exception as exc:
@@ -119,12 +122,36 @@ base.route_snapshot = route_snapshot
 base._prepare = _prepare
 
 
+def public_ip(timeout: float = 8):
+    """Get the public IP without inherited HTTP proxies.
+
+    Verification must observe the host's real routing table. A configured
+    HTTP(S)_PROXY can make ipify report the same proxy IP even when OpenVPN
+    has correctly installed the full-tunnel routes.
+    """
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"},
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=min(max(4.0, timeout), 15), context=ssl.create_default_context()) as response:
+                value = response.read(256).decode("ascii", "ignore").strip()
+            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
+                log(f"PUBLIC IP DIRECT url={url} public_ip={value}")
+                return value
+        except Exception as exc:
+            log(f"PUBLIC IP DIRECT FAIL url={url} error={type(exc).__name__}: {exc}")
+    raise RuntimeError("Unable to determine public IP without proxy")
+
+
 def verify_tunnel(previous_ip: str | None = None, timeout: float = 8):
     """Verify both full-tunnel routes and a changed public IP."""
     snapshot = route_snapshot()
     if os.name == "nt" and not snapshot:
         raise RuntimeError("VPN initialized but both Windows full-tunnel /1 routes are missing")
-    ip = base.public_ip(timeout)
+    ip = public_ip(timeout)
     if previous_ip and ip == previous_ip:
         raise RuntimeError(
             f"VPN initialized but public IP did not change ({ip}); traffic is not using the VPN"
@@ -168,7 +195,6 @@ for _name in (
     "parse_gate",
     "vpnbook_servers_from_html",
     "vpnbook_servers",
-    "public_ip",
     "full_tunnel_routes",
     "_is_real_server",
 ):
