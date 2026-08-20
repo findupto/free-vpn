@@ -133,6 +133,11 @@ def _prepare(*args, **kwargs):
                 continue
             filtered.append(line)
 
+        # Ignore duplicate server-pushed gateway directives and install one
+        # deterministic local full-tunnel policy instead. OpenVPN documents
+        # pull-filter ignore as the supported client-side mechanism.
+        filtered.append('pull-filter ignore "redirect-gateway"')
+        filtered.append('pull-filter ignore "redirect-private"')
         filtered.append("redirect-gateway def1 bypass-dhcp bypass-dns")
         filtered.append("route-metric 5")
         filtered.append("route-method exe")
