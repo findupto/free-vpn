@@ -69,7 +69,7 @@ jobs:
           Get-Item "dist/FinduptoVPN.exe" | Select-Object FullName,Length
 
       - name: Upload standalone EXE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FinduptoVPN-Windows-Standalone
           path: dist/FinduptoVPN.exe
