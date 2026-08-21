@@ -62,7 +62,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     try:
         import smart_bootstrap  # noqa: F401
-        from gui_elite import App
+        from gui_spinner import App
         App().mainloop()
     except Exception as exc:
         _show_startup_error(exc)
