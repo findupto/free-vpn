@@ -26,25 +26,17 @@ def _start_elevated() -> bool:
     """Start one elevated copy of this script and return True on success."""
     if os.name != "nt" or _is_admin():
         return True
-
     script = str(Path(__file__).resolve())
     executable = sys.executable
     result = ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "runas",
-        executable,
-        subprocess.list2cmdline([script]),
-        str(Path(script).parent),
-        1,
+        None, "runas", executable, subprocess.list2cmdline([script]), str(Path(script).parent), 1
     )
     if result <= 32:
         try:
             ctypes.windll.user32.MessageBoxW(
                 None,
-                "Administrator permission is required for the VPN tunnel.\n\n"
-                "The UAC request was cancelled or Windows could not start the elevated application.",
-                "Findupto VPN",
-                0x10,
+                "Administrator permission is required for the VPN tunnel.\n\nThe UAC request was cancelled or Windows could not start the elevated application.",
+                "Findupto VPN", 0x10,
             )
         except Exception:
             pass
@@ -58,10 +50,7 @@ def _show_startup_error(exc: Exception) -> None:
     try:
         safe_error = redact_log_message(f"{type(exc).__name__}: {exc}")
         ctypes.windll.user32.MessageBoxW(
-            None,
-            f"Findupto VPN could not start.\n\n{safe_error}",
-            "Findupto VPN",
-            0x10,
+            None, f"Findupto VPN could not start.\n\n{safe_error}", "Findupto VPN", 0x10
         )
     except Exception:
         pass
@@ -72,10 +61,9 @@ if __name__ == "__main__":
         if _start_elevated():
             raise SystemExit(0)
         raise SystemExit(1)
-
     try:
         import smart_bootstrap  # noqa: F401
-        from gui import App
+        from gui_pro import App
         App().mainloop()
     except Exception as exc:
         _show_startup_error(exc)
