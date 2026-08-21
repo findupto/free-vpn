@@ -141,21 +141,54 @@ def _install_gui_compatibility() -> None:
         from gui_elite import App as EliteApp
         if not getattr(EliteApp, "_findupto_browser_ui_wired", False):
             original_sidebar = EliteApp._build_premium_sidebar
-            original_resize = EliteApp._apply_responsive_layout
 
             def sidebar_with_browser(self):
                 original_sidebar(self)
                 button = self._button(self.sidebar, "BROWSER", self._open_browser, "primary")
-                button.pack(fill="x", padx=12, pady=(0, 10), before=self.sidebar.winfo_children()[-1])
+                nav = getattr(self, "nav_items", [])
+                before = nav[0] if nav else None
+                if before is not None:
+                    button.pack(fill="x", padx=12, pady=(0, 10), before=before)
+                else:
+                    button.pack(fill="x", padx=12, pady=(0, 10))
                 self.browser_button = button
 
             def resize_with_browser(self, width):
-                original_resize(self, width)
-                # Never hide the sidebar: Browser must remain directly accessible.
-                if not self.sidebar.winfo_ismapped():
-                    self.sidebar.pack(side="left", fill="y", before=self.content)
-                if width < 900:
-                    self.sidebar.configure(width=210)
+                """Safe responsive layout: never call pack_forget on child widgets.
+
+                The previous responsive chain could call pack_forget on a widget that
+                had already been re-parented/repacked by the premium UI, producing
+                TclError: '...buttonX isn't packed'. The sidebar is intentionally
+                persistent because it contains the Secure Browser launcher.
+                """
+                try:
+                    if not self.sidebar.winfo_ismapped():
+                        self.sidebar.pack(side="left", fill="y", before=self.content)
+                except tk.TclError:
+                    pass
+                try:
+                    compact = width < 1080
+                    pad = 14 if width < 860 else 18 if compact else 30
+                    for widget in (self.header, self.hero, self.command, self.metrics,
+                                   self.filters, self.quick, self.server_card, self.action_bar):
+                        try:
+                            widget.pack_configure(padx=pad)
+                        except tk.TclError:
+                            pass
+                    if width < 900:
+                        self.sidebar.configure(width=210)
+                    else:
+                        self.sidebar.configure(width=244)
+                    try:
+                        self.table_hint.configure(text="Scroll horizontally • double-click to connect" if width < 860 else "Live verified endpoints")
+                    except tk.TclError:
+                        pass
+                    try:
+                        self._set_table_mode("narrow" if width < 860 else "compact" if compact else "wide")
+                    except (AttributeError, tk.TclError, KeyError):
+                        pass
+                except tk.TclError:
+                    pass
 
             EliteApp._build_premium_sidebar = sidebar_with_browser
             EliteApp._apply_responsive_layout = resize_with_browser
