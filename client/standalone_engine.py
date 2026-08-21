@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Windows-facing hardening and fast-fail connection facade."""
 
+import ipaddress
 import json
 import os
 import re
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import vpn_engine as base
 
-APP_VERSION = "13.2.3"
+APP_VERSION = "13.2.4"
 ROOT = base.ROOT
 LOG = base.LOG
 PROFILE_LOGS = base.PROFILE_LOGS
@@ -183,6 +184,15 @@ except ImportError:
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=_DIRECT_SSL))
 
 
+def _valid_public_ip(value: str | None) -> str | None:
+    """Accept only a bare IPv4/IPv6 address; never treat HTML/text as an IP."""
+    candidate = str(value or "").strip().splitlines()[0].strip() if str(value or "").strip() else ""
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
 def _dns_a_records(hostname: str, timeout: float = 3.0) -> list[str]:
     transaction_id = os.urandom(2)
     name = hostname.rstrip(".")
@@ -257,9 +267,10 @@ def _dns_a_records_doh(hostname: str, timeout: float = 4.0) -> list[str]:
 
 
 def _https_get_via_ip(hostname: str, ip: str, timeout: float = 5.0) -> str:
+    path = "/ip" if hostname == "ifconfig.me" else "/"
     with socket.create_connection((ip, 443), timeout=timeout) as raw_sock:
         with _DIRECT_SSL.wrap_socket(raw_sock, server_hostname=hostname) as sock:
-            sock.sendall((f"GET / HTTP/1.1\r\nHost: {hostname}\r\nUser-Agent: {base.UA}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n").encode("ascii"))
+            sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nUser-Agent: {base.UA}\r\nAccept: text/plain\r\nConnection: close\r\n\r\n").encode("ascii"))
             chunks, total = [], 0
             while total < 4096:
                 chunk = sock.recv(min(1024, 4096 - total))
@@ -280,10 +291,11 @@ def _direct_public_ip_without_system_dns(timeout: float) -> str | None:
         addresses = _dns_a_records(hostname, min(2.5, max(1.0, timeout / 2))) or _dns_a_records_doh(hostname, min(4.0, max(2.0, timeout)))
         for ip in addresses:
             try:
-                value = _https_get_via_ip(hostname, ip, min(5.0, max(2.0, timeout)))
-                if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
+                value = _valid_public_ip(_https_get_via_ip(hostname, ip, min(5.0, max(2.0, timeout))))
+                if value:
                     log(f"PUBLIC IP DIRECT DNS-BYPASS host={hostname} ip={ip} public_ip={value}")
                     return value
+                log(f"PUBLIC IP DNS-BYPASS INVALID host={hostname} ip={ip}; response was not an IP")
             except Exception as exc:
                 log(f"PUBLIC IP DNS-BYPASS FAIL host={hostname} ip={ip} error={type(exc).__name__}: {exc}")
     return None
@@ -295,10 +307,11 @@ def public_ip(timeout: float = 8):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": base.UA, "Accept": "text/plain", "Connection": "close"})
             with _DIRECT_OPENER.open(request, timeout=min(max(3.0, timeout), 10)) as response:
-                value = response.read(256).decode("ascii", "ignore").strip()
-            if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value) or ":" in value:
+                value = _valid_public_ip(response.read(256).decode("ascii", "ignore"))
+            if value:
                 log(f"PUBLIC IP DIRECT url={url} public_ip={value}")
                 return value
+            raise RuntimeError("response did not contain a bare IP address")
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
             log(f"PUBLIC IP DIRECT FAIL url={url} error={type(exc).__name__}: {exc}")
