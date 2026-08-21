@@ -6,12 +6,13 @@ import ctypes
 import os
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 
 from privacy import redact_log_message
 
-VERSION = "14.1.0"
+VERSION = "14.2.0"
 
 
 def _is_admin() -> bool:
@@ -57,20 +58,113 @@ def _show_startup_error(exc: Exception) -> None:
 
 
 def _install_gui_compatibility() -> None:
-    """Provide legacy GUI state required by the newer premium dashboard."""
+    """Wire the premium GUI to the real OpenVPN engine and browser."""
     from gui import App as LegacyApp
+    import standalone_engine as engine
+    from browser_integration import open_secure_browser
 
-    original_refresh = LegacyApp.refresh
-    if getattr(LegacyApp.refresh, "_findupto_status_compat", False):
-        return
+    if not getattr(LegacyApp, "_findupto_runtime_wired", False):
+        original_refresh = LegacyApp.refresh
 
-    def refresh_with_status(self):
-        if not hasattr(self, "status"):
-            self.status = tk.StringVar(master=self, value="Preparing network scan…")
-        return original_refresh(self)
+        def refresh_with_status(self):
+            if not hasattr(self, "status"):
+                self.status = tk.StringVar(master=self, value="Preparing network scan…")
+            return original_refresh(self)
 
-    refresh_with_status._findupto_status_compat = True
-    LegacyApp.refresh = refresh_with_status
+        refresh_with_status._findupto_status_compat = True
+        LegacyApp.refresh = refresh_with_status
+
+        def start_connection(self, server):
+            if getattr(self, "process", None) is not None and self.process.poll() is None:
+                self.events.put(("error", None, "A VPN tunnel is already connected. Disconnect it before changing servers."))
+                return
+
+            def worker():
+                previous_ip = None
+                try:
+                    self.events.put(("status", None, f"Connecting to {server.get('country', 'VPN')} • testing the real tunnel…"))
+                    try:
+                        previous_ip = engine.public_ip(timeout=5)
+                    except Exception as exc:
+                        engine.log(f"PRECONNECT IP CHECK FAILED error={type(exc).__name__}: {exc}")
+
+                    process, work, logfile = engine.connect(server, total_deadline=75)
+                    vpn_ip = engine.verify_tunnel(previous_ip=previous_ip, timeout=10)
+                    self.process = process
+                    self.tmp = work
+                    self.current_log = logfile
+                    self.selected_server = server
+                    engine.log(f"GUI VPN CONNECTED host={server.get('host')} vpn_ip={vpn_ip}")
+                    self.events.put(("connected", None, f"CONNECTED • {server.get('country', 'VPN')} • exit IP {vpn_ip}"))
+                except Exception as exc:
+                    engine.log(f"GUI VPN CONNECTION FAILED host={server.get('host')} error={type(exc).__name__}: {exc}")
+                    self.events.put(("error", None, f"VPN connection failed for {server.get('host', 'selected server')}: {exc}"))
+
+            threading.Thread(target=worker, daemon=True, name="findupto-vpn-connect").start()
+
+        def disconnect(self):
+            process = getattr(self, "process", None)
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except Exception:
+                            process.kill()
+                except Exception as exc:
+                    engine.log(f"GUI DISCONNECT FAIL error={type(exc).__name__}: {exc}")
+            self.process = None
+            self.current_log = None
+            self.tmp = None
+            engine.log("GUI VPN DISCONNECTED")
+
+        def open_browser(self):
+            process = getattr(self, "process", None)
+            if process is None or process.poll() is not None:
+                message = "Connect the VPN first. The Secure Browser is locked until a verified VPN tunnel is active."
+                self.events.put(("error", None, message))
+                return
+            try:
+                open_secure_browser(self)
+            except Exception as exc:
+                self.events.put(("error", None, f"Secure Browser could not start: {exc}"))
+
+        LegacyApp._start_connection = start_connection
+        LegacyApp._disconnect = disconnect
+        LegacyApp._open_browser = open_browser
+        LegacyApp._findupto_runtime_wired = True
+
+    # The production app is gui_spinner -> gui_elite -> gui_pro. Add the browser
+    # launcher to the actual visible elite sidebar and keep it visible at compact widths.
+    try:
+        from gui_elite import App as EliteApp
+        if not getattr(EliteApp, "_findupto_browser_ui_wired", False):
+            original_sidebar = EliteApp._build_premium_sidebar
+            original_resize = EliteApp._apply_responsive_layout
+
+            def sidebar_with_browser(self):
+                original_sidebar(self)
+                button = self._button(self.sidebar, "BROWSER", self._open_browser, "primary")
+                button.pack(fill="x", padx=12, pady=(0, 10), before=self.sidebar.winfo_children()[-1])
+                self.browser_button = button
+
+            def resize_with_browser(self, width):
+                original_resize(self, width)
+                # Never hide the sidebar: Browser must remain directly accessible.
+                if not self.sidebar.winfo_ismapped():
+                    self.sidebar.pack(side="left", fill="y", before=self.content)
+                if width < 900:
+                    self.sidebar.configure(width=210)
+
+            EliteApp._build_premium_sidebar = sidebar_with_browser
+            EliteApp._apply_responsive_layout = resize_with_browser
+            EliteApp._findupto_browser_ui_wired = True
+    except Exception as exc:
+        try:
+            engine.log(f"BROWSER UI WIRING FAIL error={type(exc).__name__}: {exc}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
