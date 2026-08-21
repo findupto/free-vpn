@@ -10,7 +10,7 @@ from pathlib import Path
 
 from privacy import redact_log_message
 
-VERSION = "14.0.0"
+VERSION = "14.1.0"
 
 
 def _is_admin() -> bool:
@@ -23,7 +23,6 @@ def _is_admin() -> bool:
 
 
 def _start_elevated() -> bool:
-    """Start one elevated copy of this script and return True on success."""
     if os.name != "nt" or _is_admin():
         return True
     script = str(Path(__file__).resolve())
@@ -63,7 +62,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     try:
         import smart_bootstrap  # noqa: F401
-        from gui_pro import App
+        from gui_elite import App
         App().mainloop()
     except Exception as exc:
         _show_startup_error(exc)
