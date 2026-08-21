@@ -2,20 +2,25 @@
 
 A lightweight desktop VPN client that discovers live public OpenVPN servers, ranks them, uses multiple transport methods and server endpoints, retries intelligently, and refuses to report success until the tunnel is actually usable.
 
-## v13.2.0
+## v14.0.0
 
-This release upgrades the Windows connection engine with fast multi-method failover:
+This release adds a first production-hardening batch around the existing VPN engine:
 
-- VPNBook automatically tries **TCP/443, TCP/80, UDP/53 and UDP/25000** when available;
-- VPN Gate profiles with multiple `remote` endpoints are expanded into independent fallback attempts;
-- dead transports fail fast instead of waiting through long OpenVPN retries;
-- each candidate server is capped at a short connection budget so one dead server cannot monopolize the queue;
-- successful OpenVPN work directories are retained until disconnect, fixing cleanup of the live auth/config/log files;
-- failed attempts are terminated and cleaned immediately;
-- Windows full-tunnel validation requires both `0.0.0.0/1` and `128.0.0.0/1` routes;
-- public-IP verification bypasses configured HTTP(S) proxies and requires an actual IP change;
-- DCO is disabled for public/community profiles and legacy CBC cipher compatibility is retained;
-- the existing strict success rule remains: initialization + full-tunnel routes + changed public IP.
+- durable SQLite persistence for backend server/device metadata;
+- node heartbeats, health thresholds, and stale-node handling;
+- replay-resistant HMAC envelopes for control-plane requests;
+- validated, expiring subscription state;
+- rolling server health scoring with stale-metric expiry;
+- latency, jitter, packet-loss, and bandwidth-aware server scoring;
+- cross-platform DNS resolver configuration verification;
+- public-IP and IPv6 connectivity diagnostics;
+- stronger VPN endpoint and allowed-network validation;
+- deterministic configuration signatures;
+- bounded exponential reconnect backoff with cancellation;
+- temporary server quarantine after repeated failures;
+- privacy-safe startup diagnostic redaction;
+- regression coverage for the new hardening behavior;
+- project license, security policy, contribution rules, issue/PR templates, dependency update automation, and security CI.
 
 ## Supported platforms
 
@@ -53,6 +58,8 @@ Diagnostics are stored under `%LOCALAPPDATA%\FinduptoVPN` on Windows and the sys
 - `diagnostic.log` — discovery, runtime, route, and connection diagnostics
 - `servers.json` — short-lived validated discovery cache
 - `openvpn-logs\<server>-last-failure.log` — latest failed connection log
+
+Do not publish raw diagnostic logs because network identifiers and operational details may be sensitive.
 
 ## Tunnel success rule
 
