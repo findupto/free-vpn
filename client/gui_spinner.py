@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from country_spinner import CountrySpinner
+from connection_progress import install_connection_progress
 from gui_elite import App as EliteApp, BG, SURFACE, PANEL, PANEL_2, PANEL_3, BORDER, BORDER_HI, TEXT, MUTED, ACCENT, ACCENT_2, SUCCESS, WARNING, CYAN, FONT
 
 FLAGS = {
@@ -221,6 +222,10 @@ class App(EliteApp):
         bottom = tk.Frame(self.spinner_panel, bg=SURFACE); bottom.pack(fill="x", padx=18, pady=(0, 11))
         self.spinner_countdown_label = tk.Label(bottom, text="NEXT SWITCH  •  STANDBY", bg=SURFACE, fg=MUTED, font=(FONT, 7, "bold")); self.spinner_countdown_label.pack(side="left")
         self.spinner_history_label = tk.Label(bottom, text="Rotation history: 0", bg=SURFACE, fg=MUTED, font=(FONT, 7)); self.spinner_history_label.pack(side="right")
+
+
+# Install the live connection progress layer after the concrete spinner App class exists.
+install_connection_progress(App)
 
 
 if __name__ == "__main__":
