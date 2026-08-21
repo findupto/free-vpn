@@ -6,6 +6,7 @@ import ctypes
 import os
 import subprocess
 import sys
+import tkinter as tk
 from pathlib import Path
 
 from privacy import redact_log_message
@@ -55,6 +56,23 @@ def _show_startup_error(exc: Exception) -> None:
         pass
 
 
+def _install_gui_compatibility() -> None:
+    """Provide legacy GUI state required by the newer premium dashboard."""
+    from gui import App as LegacyApp
+
+    original_refresh = LegacyApp.refresh
+    if getattr(LegacyApp.refresh, "_findupto_status_compat", False):
+        return
+
+    def refresh_with_status(self):
+        if not hasattr(self, "status"):
+            self.status = tk.StringVar(master=self, value="Preparing network scan…")
+        return original_refresh(self)
+
+    refresh_with_status._findupto_status_compat = True
+    LegacyApp.refresh = refresh_with_status
+
+
 if __name__ == "__main__":
     if os.name == "nt" and not _is_admin():
         if _start_elevated():
@@ -62,6 +80,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     try:
         import smart_bootstrap  # noqa: F401
+        _install_gui_compatibility()
         from gui_spinner import App
         App().mainloop()
     except Exception as exc:
