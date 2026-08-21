@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import queue
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tkinter import messagebox, ttk
 
 import standalone_engine as engine
@@ -14,248 +17,240 @@ import runtime_bootstrap
 
 APP = "Findupto VPN"
 VERSION = engine.APP_VERSION
+FAST_LIMIT_MS = 250
+PROBE_TIMEOUT = 2.5
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP} {VERSION}")
-        self._set_initial_geometry()
+        width = max(860, min(1320, self.winfo_screenwidth() - 70))
+        height = max(600, min(800, self.winfo_screenheight() - 100))
+        self.geometry(f"{width}x{height}")
+        self.minsize(860, 600)
         self.events = queue.Queue()
         self.servers = []
-        self.process = None
-        self.tmp = None
-        self.current_log = None
+        self.process = self.tmp = self.current_log = None
         self.busy = False
         self.cancel_event = threading.Event()
         self._build()
         self.after(100, self._pump)
         self.refresh()
 
-    def _set_initial_geometry(self):
-        width = max(760, min(1240, self.winfo_screenwidth() - 80))
-        height = max(520, min(720, self.winfo_screenheight() - 120))
-        self.geometry(f"{width}x{height}")
-        self.minsize(760, 520)
-
     def _build(self):
-        head = ttk.Frame(self, padding=14)
-        head.pack(fill="x")
-        ttk.Label(head, text=APP, font=("Segoe UI", 20, "bold")).pack(side="left")
-        ttk.Label(head, text=f"  Live Free VPN • {VERSION}").pack(side="left", pady=7)
+        head = ttk.Frame(self, padding=(18, 16, 18, 8)); head.pack(fill="x")
+        ttk.Label(head, text=APP, font=("Segoe UI", 22, "bold")).pack(side="left")
+        ttk.Label(head, text=f"  FAST • LIVE • AUTO CONNECT  {VERSION}").pack(side="left", padx=12, pady=7)
         self.status = tk.StringVar(value="Starting...")
-        ttk.Label(self, textvariable=self.status, padding=(14, 0, 14, 10)).pack(fill="x")
-        frame = ttk.Frame(self, padding=(14, 0, 14, 0))
-        frame.pack(fill="both", expand=True)
-        cols = ("country", "city", "host", "ip", "ping", "speed", "source")
+        ttk.Label(self, textvariable=self.status, padding=(18, 0, 18, 10)).pack(fill="x")
+
+        filters = ttk.LabelFrame(self, text="Fast server filters", padding=10); filters.pack(fill="x", padx=18, pady=(0, 10))
+        self.fast_only = tk.BooleanVar(value=True)
+        self.available_only = tk.BooleanVar(value=True)
+        self.auto_connect = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filters, text="Fast only (<250 ms)", variable=self.fast_only, command=self._apply_filters).pack(side="left", padx=6)
+        ttk.Checkbutton(filters, text="Available only", variable=self.available_only, command=self._apply_filters).pack(side="left", padx=6)
+        ttk.Checkbutton(filters, text="Auto-connect fastest verified", variable=self.auto_connect).pack(side="left", padx=6)
+        ttk.Label(filters, text="Max ping:").pack(side="left", padx=(18, 5))
+        self.max_ping = tk.IntVar(value=250)
+        spin = ttk.Spinbox(filters, from_=50, to=2000, increment=25, width=7, textvariable=self.max_ping, command=self._apply_filters)
+        spin.pack(side="left")
+        ttk.Label(filters, text="ms").pack(side="left", padx=3)
+
+        stats = ttk.Frame(self, padding=(18, 0, 18, 8)); stats.pack(fill="x")
+        self.stats = tk.StringVar(value="0 servers")
+        ttk.Label(stats, textvariable=self.stats, font=("Segoe UI", 11, "bold")).pack(side="left")
+        self.speed_status = tk.StringVar(value="Live availability probing...")
+        ttk.Label(stats, textvariable=self.speed_status).pack(side="right")
+
+        frame = ttk.Frame(self, padding=(18, 0, 18, 0)); frame.pack(fill="both", expand=True)
+        cols = ("status", "country", "city", "host", "ping", "speed", "score", "source")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="browse")
-        widths = (130, 140, 250, 130, 85, 105, 110)
+        widths = (90, 125, 120, 240, 80, 100, 90, 105)
         for col, width in zip(cols, widths):
             self.tree.heading(col, text=col.title())
-            self.tree.column(col, width=width, minwidth=70, anchor="w", stretch=True)
-        y = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        x = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+            self.tree.column(col, width=width, minwidth=65, anchor="w", stretch=True)
+        y = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview); x = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=y.set, xscrollcommand=x.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        y.grid(row=0, column=1, sticky="ns")
-        x.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-        bar = ttk.Frame(self, padding=14)
-        bar.pack(fill="x")
-        self.refresh_btn = ttk.Button(bar, text="Refresh Live Servers", command=self.refresh)
-        self.refresh_btn.pack(side="left")
-        self.best_btn = ttk.Button(bar, text="Connect Fastest", command=self.best)
-        self.best_btn.pack(side="left", padx=7)
-        self.sel_btn = ttk.Button(bar, text="Connect Selected", command=self.selected)
-        self.sel_btn.pack(side="left")
-        ttk.Button(bar, text="Open Diagnostic Log", command=self.open_log).pack(side="left", padx=7)
-        ttk.Button(bar, text="Open Latest OpenVPN Log", command=self.open_openvpn_logs).pack(side="left")
+        self.tree.grid(row=0, column=0, sticky="nsew"); y.grid(row=0, column=1, sticky="ns"); x.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1); frame.columnconfigure(0, weight=1)
+
+        bar = ttk.Frame(self, padding=14); bar.pack(fill="x")
+        self.refresh_btn = ttk.Button(bar, text="Refresh & Test Servers", command=self.refresh); self.refresh_btn.pack(side="left")
+        self.best_btn = ttk.Button(bar, text="⚡ Connect Fastest", command=self.best); self.best_btn.pack(side="left", padx=7)
+        self.sel_btn = ttk.Button(bar, text="Connect Selected", command=self.selected); self.sel_btn.pack(side="left")
+        ttk.Button(bar, text="Diagnostics", command=self.open_log).pack(side="left", padx=7)
+        ttk.Button(bar, text="OpenVPN Logs", command=self.open_openvpn_logs).pack(side="left")
         ttk.Button(bar, text="Disconnect", command=self.disconnect).pack(side="right")
 
     def _set_busy(self, value):
         self.busy = value
         state = "disabled" if value else "normal"
-        for button in (self.refresh_btn, self.best_btn, self.sel_btn):
-            button.configure(state=state)
+        for b in (self.refresh_btn, self.best_btn, self.sel_btn): b.configure(state=state)
+
+    @staticmethod
+    def _probe(server):
+        host = str(server.get("ip") or server.get("host") or "")
+        if not host: return dict(server, available=False, live_ping=9999)
+        ports = (443, 80, 53) if server.get("kind") == "gate" else (443, 80)
+        best = None
+        for port in ports:
+            started = time.monotonic()
+            try:
+                with socket.create_connection((host, port), timeout=PROBE_TIMEOUT):
+                    latency = (time.monotonic() - started) * 1000
+                    best = latency if best is None else min(best, latency)
+            except OSError:
+                continue
+        if best is None: return dict(server, available=False, live_ping=9999)
+        return dict(server, available=True, live_ping=best, ping=best, rank=float(server.get("rank", 0)) + max(0, 500 - best))
 
     def refresh(self):
-        if self.busy:
-            return
-        self.cancel_event.clear()
-        self._set_busy(True)
-        self.status.set("Discovering live public VPN servers...")
+        if self.busy: return
+        self.cancel_event.clear(); self._set_busy(True)
+        self.status.set("Discovering servers and testing availability in parallel...")
         threading.Thread(target=self._discover_worker, daemon=True).start()
 
     def _discover_worker(self):
         try:
             data = engine.discover(10)
-            self.events.put(("servers", data, f"Live catalog ready — {len(data)} candidates"))
+            # Probe the best catalog candidates concurrently; this prevents the UI from
+            # calling a slow/dead server simply because its catalog score is high.
+            probe_pool = data[:100]
+            tested = []
+            with ThreadPoolExecutor(max_workers=24, thread_name_prefix="vpn-probe") as pool:
+                futures = [pool.submit(self._probe, s) for s in probe_pool]
+                for f in as_completed(futures):
+                    if self.cancel_event.is_set(): break
+                    tested.append(f.result())
+            tested.sort(key=lambda s: (not s.get("available", False), s.get("live_ping", 9999), -float(s.get("speed", 0)), -float(s.get("rank", 0))))
+            self.events.put(("servers", tested, f"Live test complete — {len(tested)} servers checked"))
         except Exception as exc:
-            engine.log(f"DISCOVERY FATAL {type(exc).__name__}: {exc}")
-            self.events.put(("error", None, f"Discovery failed: {exc}\n\n{engine.LOG}"))
+            engine.log(f"DISCOVERY/PROBE FATAL {type(exc).__name__}: {exc}")
+            self.events.put(("error", None, f"Server discovery failed: {exc}"))
+
+    def _apply_filters(self):
+        self._render(self.servers)
+
+    def _eligible(self):
+        try: limit = max(50, int(self.max_ping.get()))
+        except Exception: limit = FAST_LIMIT_MS
+        result = []
+        for s in self.servers:
+            if self.available_only.get() and not s.get("available"): continue
+            if self.fast_only.get() and float(s.get("live_ping", s.get("ping", 9999))) > limit: continue
+            result.append(s)
+        return sorted(result, key=lambda s: (s.get("live_ping", 9999), -float(s.get("speed", 0)), -float(s.get("rank", 0))))
 
     def _render(self, data):
-        self.servers = data
         self.tree.delete(*self.tree.get_children())
-        for index, server in enumerate(data):
-            ping = "-" if server.get("ping", 9999) >= 9999 else f"{server['ping']:.0f} ms"
-            speed = "-" if not server.get("speed") else f"{server['speed']:.1f} Mbps"
-            self.tree.insert("", "end", iid=str(index), values=(server.get("country", ""), server.get("city", ""), server.get("host", ""), server.get("ip", ""), ping, speed, server.get("source", "")))
+        visible = []
+        for server in data:
+            try: limit = max(50, int(self.max_ping.get()))
+            except Exception: limit = FAST_LIMIT_MS
+            if self.available_only.get() and not server.get("available"): continue
+            if self.fast_only.get() and float(server.get("live_ping", server.get("ping", 9999))) > limit: continue
+            visible.append(server)
+        self.servers = data
+        for index, s in enumerate(visible):
+            ping = s.get("live_ping", s.get("ping", 9999)); ping_text = "-" if ping >= 9999 else f"{ping:.0f} ms"
+            speed = s.get("speed") or 0; speed_text = f"{speed:.1f} Mbps" if speed else "-"
+            score = s.get("rank", s.get("score", 0))
+            self.tree.insert("", "end", iid=str(data.index(s)), values=("● FAST" if s.get("available") and ping <= FAST_LIMIT_MS else ("● ONLINE" if s.get("available") else "OFFLINE"), s.get("country", ""), s.get("city", ""), s.get("host", ""), ping_text, speed_text, f"{float(score):.0f}", s.get("source", "")))
+        available = sum(1 for s in data if s.get("available")); fast = sum(1 for s in data if s.get("available") and s.get("live_ping", 9999) <= FAST_LIMIT_MS)
+        self.stats.set(f"{len(visible)} shown  •  {available} available  •  {fast} fast  •  {len(data)} tested")
 
     def best(self):
-        if not self.servers:
-            messagebox.showwarning(APP, "No servers available. Refresh first.")
+        candidates = self._eligible()
+        if not candidates:
+            messagebox.showwarning(APP, "No fast, available server passed the current filters. Refresh or raise the ping limit.")
             return
-        gate = [s for s in self.servers if s.get("kind") == "gate"][:32]
-        book = [s for s in self.servers if s.get("kind") == "book"][:8]
-        self._connect(gate + book)
+        self._connect(candidates[:24])
 
     def selected(self):
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning(APP, "Select a server first.")
-            return
-        self._connect([self.servers[int(selected[0])]])
+            messagebox.showwarning(APP, "Select a server first."); return
+        try: server = self.servers[int(selected[0])]
+        except (ValueError, IndexError):
+            messagebox.showwarning(APP, "That server is no longer in the live list."); return
+        if self.available_only.get() and not server.get("available"):
+            messagebox.showwarning(APP, "This server is not currently available."); return
+        self._connect([server])
 
     def _connect(self, candidates):
-        if self.busy:
-            return
-        if not candidates:
-            messagebox.showwarning(APP, "No valid server candidates are available.")
-            return
-        self.cancel_event.clear()
-        self._set_busy(True)
-        self.status.set(f"Trying {len(candidates)} live candidates; full-tunnel verification is mandatory...")
+        if self.busy or not candidates: return
+        self.cancel_event.clear(); self._set_busy(True)
+        self.status.set(f"Connecting: trying up to {len(candidates)} verified fast servers...")
         threading.Thread(target=self._connect_worker, args=(candidates,), daemon=True).start()
 
     @staticmethod
     def _stop_process(process, tmp=None):
         if process is not None:
-            try:
-                process.terminate()
-                process.wait(timeout=3)
+            try: process.terminate(); process.wait(timeout=3)
             except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
+                try: process.kill()
+                except Exception: pass
+        if tmp: shutil.rmtree(tmp, ignore_errors=True)
 
     def _connect_worker(self, candidates):
         errors = []
-        try:
-            baseline = engine.public_ip(6)
-            engine.log(f"CONNECT BASELINE public_ip={baseline}")
-        except Exception as exc:
-            baseline = None
-            engine.log(f"CONNECT BASELINE unavailable error={type(exc).__name__}: {exc}")
+        try: baseline = engine.public_ip(6)
+        except Exception: baseline = None
         for server in candidates:
-            if self.cancel_event.is_set() or self.process is not None:
-                return
+            if self.cancel_event.is_set() or self.process is not None: return
             try:
-                self.events.put(("status", None, f"Trying {server['host']} ({server['source']})..."))
-                if not runtime_bootstrap.install_bundled_drivers():
-                    engine.log("RUNTIME DRIVER bootstrap: no bundled INF installed; continuing with existing driver")
+                self.events.put(("status", None, f"⚡ {server['host']} • {server.get('live_ping', 0):.0f} ms • connecting..."))
+                runtime_bootstrap.install_bundled_drivers()
                 process, tmp, logfile = engine.connect(server, 45)
-                if self.cancel_event.is_set():
-                    self._stop_process(process, tmp)
-                    self.events.put(("cancelled", None, "Disconnected"))
-                    return
-                try:
-                    if process.poll() is not None:
-                        raise RuntimeError("VPN process exited immediately after initialization")
-                    ip = engine.verify_tunnel(baseline, 10)
-                except Exception as verify_exc:
-                    engine.log(f"POST-CONNECT VERIFICATION FAIL server={server['host']} error={type(verify_exc).__name__}: {verify_exc}")
-                    self._stop_process(process, tmp)
-                    raise
-                if self.cancel_event.is_set():
-                    self._stop_process(process, tmp)
-                    self.events.put(("cancelled", None, "Disconnected"))
-                    return
+                if self.cancel_event.is_set(): self._stop_process(process, tmp); return
+                if process.poll() is not None: raise RuntimeError("VPN process exited after startup")
+                ip = engine.verify_tunnel(baseline, 10)
                 self.process, self.tmp, self.current_log = process, tmp, logfile
-                engine.log(f"VPN CONNECTED AND VERIFIED server={server['host']} public_ip={ip}")
-                self.events.put(("connected", None, f"CONNECTED — {server['host']} — public IP {ip}"))
-                return
+                engine.log(f"VPN CONNECTED VERIFIED server={server['host']} public_ip={ip} live_ping={server.get('live_ping')}")
+                self.events.put(("connected", None, f"CONNECTED • {server['host']} • {server.get('live_ping', 0):.0f} ms • IP {ip}")); return
             except Exception as exc:
-                message = f"{server['host']}: {exc}"
-                errors.append(message)
-                engine.log(message)
-        if not self.cancel_event.is_set():
-            self.events.put(("error", None, "No candidate connected successfully.\n\n" + "\n".join(errors[:20]) + f"\n\nDiagnostic log:\n{engine.LOG}\nLatest OpenVPN failure log:\n{engine.PROFILE_LOGS}"))
+                errors.append(f"{server['host']}: {exc}"); engine.log(errors[-1])
+        if not self.cancel_event.is_set(): self.events.put(("error", None, "No verified fast server connected.\n\n" + "\n".join(errors[:12])))
 
     def disconnect(self):
-        self.cancel_event.set()
-        process = self.process
-        tmp = self.tmp
-        self.process = None
-        self.tmp = None
-        self.current_log = None
-        if process is not None:
-            engine.log("DISCONNECT")
-            self._stop_process(process, tmp)
-        elif tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
-        if hasattr(self, "status"):
-            self.status.set("Disconnected")
-        if hasattr(self, "refresh_btn"):
-            self._set_busy(False)
+        self.cancel_event.set(); process, tmp = self.process, self.tmp
+        self.process = self.tmp = self.current_log = None
+        if process is not None: self._stop_process(process, tmp)
+        elif tmp: shutil.rmtree(tmp, ignore_errors=True)
+        if hasattr(self, "status"): self.status.set("Disconnected")
+        if hasattr(self, "refresh_btn"): self._set_busy(False)
 
     @staticmethod
     def _open_path(path):
-        path = str(path)
         try:
-            if os.name == "nt":
-                os.startfile(path)
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
+            if os.name == "nt": os.startfile(str(path))
+            elif sys.platform == "darwin": subprocess.Popen(["open", str(path)])
+            else: subprocess.Popen(["xdg-open", str(path)])
             return True
-        except Exception:
-            return False
+        except Exception: return False
 
     def open_log(self):
-        engine.ROOT.mkdir(parents=True, exist_ok=True)
-        engine.LOG.touch(exist_ok=True)
-        if not self._open_path(engine.LOG):
-            messagebox.showinfo(APP, f"Diagnostic log:\n{engine.LOG}")
+        engine.ROOT.mkdir(parents=True, exist_ok=True); engine.LOG.touch(exist_ok=True)
+        if not self._open_path(engine.LOG): messagebox.showinfo(APP, f"Diagnostic log:\n{engine.LOG}")
 
     def open_openvpn_logs(self):
         engine.PROFILE_LOGS.mkdir(parents=True, exist_ok=True)
-        if not self._open_path(engine.PROFILE_LOGS):
-            messagebox.showinfo(APP, f"Latest OpenVPN failure log:\n{engine.PROFILE_LOGS}")
+        if not self._open_path(engine.PROFILE_LOGS): messagebox.showinfo(APP, f"OpenVPN logs:\n{engine.PROFILE_LOGS}")
 
     def _pump(self):
         try:
             while True:
-                kind, data, message = self.events.get_nowait()
-                if kind == "servers":
-                    self._render(data)
-                    self._set_busy(False)
-                    self.status.set(message)
-                elif kind == "status":
-                    self.status.set(message)
-                elif kind == "connected":
-                    self._set_busy(False)
-                    self.status.set(message)
-                elif kind == "cancelled":
-                    self._set_busy(False)
-                    self.status.set(message)
-                elif kind == "error":
-                    self._set_busy(False)
-                    self.status.set("Failed — see diagnostics")
-                    messagebox.showerror(APP, message)
-        except queue.Empty:
-            pass
+                kind, _, msg = self.events.get_nowait()
+                if kind == "servers": self._render(msg if isinstance(msg, list) else []); self._set_busy(False); self.status.set("Live servers ready")
+                elif kind == "status": self.status.set(msg)
+                elif kind == "connected": self._set_busy(False); self.status.set(msg)
+                elif kind == "error": self._set_busy(False); self.status.set("No connection"); messagebox.showerror(APP, msg)
+        except queue.Empty: pass
         self.after(100, self._pump)
 
-    def destroy(self):
-        self.disconnect()
-        super().destroy()
+    def destroy(self): self.disconnect(); super().destroy()
 
 
-if __name__ == "__main__":
-    App().mainloop()
+if __name__ == "__main__": App().mainloop()
