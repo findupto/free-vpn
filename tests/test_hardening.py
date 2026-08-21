@@ -41,11 +41,10 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(plane.mark_stale(), ["n1"])
         self.assertEqual(plane.get_available_nodes(), [])
 
-    def test_billing_expiry_returns_free(self):
+    def test_billing_rejects_expired_activation(self):
         billing = BillingSystem()
-        self.assertTrue(billing.activate("u1", "pro", int(time.time()) + 60))
-        self.assertEqual(billing.get_plan("u1"), "pro")
-        self.assertTrue(billing.activate("u1", "pro", int(time.time()) - 1) is False)
+        self.assertFalse(billing.activate("u1", "pro", int(time.time()) - 1))
+        self.assertIsNone(billing.get_plan("u1"))
 
     def test_config_validator_rejects_invalid_network(self):
         result = ConfigValidator().validate({"server_public_key": "x" * 32, "endpoint": "1.2.3.4:443", "allowed_ips": ["bad"]})
@@ -63,9 +62,15 @@ class HardeningTests(unittest.TestCase):
 
     def test_benchmark_records_loss_and_jitter(self):
         benchmark = ServerBenchmark()
-        calls = iter([None, RuntimeError("timeout"), None])
-        benchmark.measure_latency("s1", lambda _: (_ for _ in ()).throw(next(calls)), samples=3)
-        self.assertIn("packet_loss", benchmark.results["s1"])
+        calls = iter([0, 1, 0])
+
+        def ping(_):
+            if next(calls):
+                raise TimeoutError("timeout")
+
+        benchmark.measure_latency("s1", ping, samples=3)
+        self.assertEqual(benchmark.results["s1"]["packet_loss"], 1 / 3)
+        self.assertIn("jitter_ms", benchmark.results["s1"])
 
     def test_reconnect_can_cancel(self):
         controller = ReconnectController(max_attempts=5, base_delay=0)
