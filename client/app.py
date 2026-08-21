@@ -8,7 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "13.2.3"
+from privacy import redact_log_message
+
+VERSION = "14.0.0"
 
 
 def _is_admin() -> bool:
@@ -54,9 +56,10 @@ def _show_startup_error(exc: Exception) -> None:
     if os.name != "nt":
         return
     try:
+        safe_error = redact_log_message(f"{type(exc).__name__}: {exc}")
         ctypes.windll.user32.MessageBoxW(
             None,
-            f"Findupto VPN could not start.\n\n{type(exc).__name__}: {exc}",
+            f"Findupto VPN could not start.\n\n{safe_error}",
             "Findupto VPN",
             0x10,
         )
@@ -71,9 +74,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     try:
-        # Install adaptive server ranking around the existing engine before
-        # the GUI imports its engine module. No new branch or GUI rewrite is
-        # required; the existing connect/discover API stays unchanged.
         import smart_bootstrap  # noqa: F401
         from gui import App
         App().mainloop()
