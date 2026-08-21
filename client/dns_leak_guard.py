@@ -1,10 +1,10 @@
-"""
-Findupto VPN DNS Leak Protection
+"""Cross-platform DNS configuration verification helpers."""
 
-Provides DNS protection lifecycle and verification hooks.
-OS-specific DNS enforcement should be implemented by platform adapters.
-"""
+from __future__ import annotations
 
+import os
+import re
+import subprocess
 from dataclasses import dataclass
 
 
@@ -13,6 +13,8 @@ class DNSStatus:
     enabled: bool = False
     protected_dns: str | None = None
     leak_check_passed: bool = False
+    observed_servers: tuple[str, ...] = ()
+    reason: str = "not checked"
 
 
 class DNSLeakGuard:
@@ -29,9 +31,31 @@ class DNSLeakGuard:
         self.status = DNSStatus()
         return self.status
 
+    def _observed_servers(self) -> tuple[str, ...]:
+        if os.name == "nt":
+            try:
+                output = subprocess.check_output(
+                    ["ipconfig", "/all"], text=True, errors="replace", timeout=4,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError):
+                return ()
+            return tuple(dict.fromkeys(re.findall(r"(?:DNS Servers|DNS-Server)[ .]*:?[ \t]+([0-9a-fA-F:.]+)", output)))
+        try:
+            text = open("/etc/resolv.conf", encoding="utf-8", errors="replace").read()
+        except OSError:
+            return ()
+        return tuple(dict.fromkeys(re.findall(r"^\s*nameserver\s+([^\s#]+)", text, re.MULTILINE)))
+
     def verify(self):
-        # Platform DNS leak testing integration point
-        self.status.leak_check_passed = self.status.enabled
+        if not self.status.enabled or not self.dns_server:
+            self.status.leak_check_passed = False
+            self.status.reason = "DNS protection is not enabled"
+            return self.status
+        observed = self._observed_servers()
+        self.status.observed_servers = observed
+        self.status.leak_check_passed = bool(observed) and set(observed) == {self.dns_server}
+        self.status.reason = "resolver configuration matches protected DNS" if self.status.leak_check_passed else "system resolver configuration differs from protected DNS"
         return self.status
 
     def get_status(self):
