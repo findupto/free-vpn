@@ -1,0 +1,44 @@
+name: Security and quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile sources
+        run: python -m compileall -q client backend production security tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Static checks
+        run: |
+          python -m pip install --disable-pip-version-check ruff
+          ruff check client backend production security tests
+      - name: Dependency audit
+        run: |
+          python -m pip install --disable-pip-version-check pip-audit
+          pip-audit -r client/requirements.txt
+
+  codeql:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
