@@ -3,17 +3,30 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-from gui_spinner import App as SpinnerApp
-from gui_elite import BG, SURFACE, PANEL, PANEL_2, PANEL_3, BORDER, BORDER_HI, TEXT, MUTED, ACCENT, ACCENT_2, SUCCESS, WARNING, DANGER, CYAN, FONT
+from gui import App as LegacyApp
+from gui_elite import App as EliteApp, BG, SURFACE, PANEL, PANEL_2, PANEL_3, BORDER, BORDER_HI, TEXT, MUTED, ACCENT, ACCENT_2, SUCCESS, WARNING, DANGER, CYAN, FONT
 
 
-class App(SpinnerApp):
+class App(EliteApp):
     """Modern Findupto VPN desktop dashboard.
 
     Keeps the existing discovery, connection, IP rotation and diagnostics
     engine while replacing the crowded command-center presentation with a
     connection-first layout.
     """
+
+    # app.py installs the real lifecycle implementation on LegacyApp before
+    # the application instance is created. These delegates resolve that
+    # implementation at call time, so the modern UI stays compatible with the
+    # existing verified connection/session controller.
+    def _start_connection(self, server):
+        return LegacyApp._start_connection(self, server)
+
+    def _change_ip(self):
+        return LegacyApp._change_ip(self)
+
+    def _open_browser(self):
+        return LegacyApp._open_browser(self)
 
     def _build_premium_sidebar(self):
         self.sidebar.configure(width=224, bg=SURFACE)
@@ -58,7 +71,6 @@ class App(SpinnerApp):
         self.status_pill = tk.Label(self.header, text="●  READY", bg=PANEL_2, fg=MUTED, padx=13, pady=8, font=(FONT, 8, "bold"), highlightthickness=1, highlightbackground=BORDER_HI)
         self.status_pill.pack(side="right", pady=(4, 0))
 
-        # Connection-first hero: the three critical controls are always visible.
         self.hero = self._card(self.content, bg=SURFACE, accent=True, glow=True)
         self.hero.pack(fill="x", padx=30, pady=(0, 12))
         top = tk.Frame(self.hero, bg=SURFACE); top.pack(fill="x", padx=22, pady=(18, 8))
@@ -123,15 +135,10 @@ class App(SpinnerApp):
         self.sel_btn = self._button(self.action_bar, "CONNECT SELECTED", self.selected, "primary"); self.sel_btn.pack(side="left", padx=7)
         self.diag_btn = self._button(self.action_bar, "DIAGNOSTICS", self.open_log, "ghost"); self.diag_btn.pack(side="left")
 
-        # Keep the live route inspector, but place it below the server list so it
-        # acts as detail-on-demand instead of competing with the primary controls.
-        self._build_ip_inspector()
-
     def _set_connection_view(self, connected=False, server=None, ip=None):
         try:
             if connected and server:
-                country = server.get("country") or "Global"
-                city = server.get("city") or ""
+                country = server.get("country") or "Global"; city = server.get("city") or ""
                 self.connection_title.configure(text=f"Connected • {country}")
                 self.connection_detail.configure(text=f"{city}  •  {server.get('host') or server.get('ip') or 'verified endpoint'}")
                 self.current_ip.set(str(ip or "—"))
@@ -147,14 +154,12 @@ class App(SpinnerApp):
     def _connect(self, candidates):
         super()._connect(candidates)
         if candidates:
-            s = candidates[0]
-            self._set_connection_view(False, s)
+            self._set_connection_view(False, candidates[0])
 
     def _render(self):
         super()._render()
         try:
-            if getattr(self, "servers", None):
-                self.speed_status.set("Live verified pool")
+            if getattr(self, "servers", None): self.speed_status.set("Live verified pool")
         except tk.TclError:
             pass
 
@@ -171,26 +176,16 @@ class App(SpinnerApp):
         pad = 12 if narrow else 18 if compact else 30
         for widget in (self.header, self.hero, self.metrics, self.filters, self.quick, self.server_card, self.action_bar):
             widget.pack_configure(padx=pad)
-        try:
-            self.ip_panel.pack_configure(padx=pad)
-        except Exception:
-            pass
         if narrow:
-            self.status_pill.pack_forget()
-            self._set_table_mode("narrow")
+            self.status_pill.pack_forget(); self._set_table_mode("narrow")
         elif compact:
-            self.status_pill.pack(side="right", pady=(4, 0))
-            self._set_table_mode("compact")
+            self.status_pill.pack(side="right", pady=(4, 0)); self._set_table_mode("compact")
         else:
-            self.status_pill.pack(side="right", pady=(4, 0))
-            self._set_table_mode("wide")
+            self.status_pill.pack(side="right", pady=(4, 0)); self._set_table_mode("wide")
 
     def _set_busy(self, value):
         super()._set_busy(value)
         try:
-            if value:
-                self.status_pill.configure(text="●  SCANNING", fg=WARNING)
-            else:
-                self.status_pill.configure(text="●  READY", fg=MUTED)
+            self.status_pill.configure(text="●  SCANNING" if value else "●  READY", fg=WARNING if value else MUTED)
         except tk.TclError:
             pass
