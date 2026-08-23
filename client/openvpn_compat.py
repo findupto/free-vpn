@@ -15,8 +15,6 @@ def _rewrite_gate_profile(profile: str, server: dict) -> str:
         if stripped.lower().startswith("remote "):
             fields = stripped.split()
             if len(fields) >= 2:
-                # Preserve the provider's port/protocol and only replace the
-                # DDNS host, matching VPN Gate's official IP-based profile.
                 fields[1] = ip
                 line = " ".join(fields)
                 replaced = True
@@ -27,9 +25,27 @@ def _rewrite_gate_profile(profile: str, server: dict) -> str:
 
 
 def install(engine) -> None:
+    """Install the profile wrapper on the module that actually owns _profiles.
+
+    standalone_engine is a facade over vpn_engine and does not expose every
+    private helper from the base engine. Older startup code assumed it did,
+    which caused the application to fail before the GUI could start.
+    """
     if getattr(engine, "_findupto_openvpn_compat", False):
         return
-    original_profiles = engine._profiles
+
+    target = engine if hasattr(engine, "_profiles") else getattr(engine, "base", None)
+    if target is None or not hasattr(target, "_profiles"):
+        # Never make the application unstartable merely because the optional
+        # compatibility wrapper cannot be installed. The normal engine can
+        # still operate with its provider profile unchanged.
+        try:
+            engine.log("OPENVPN COMPAT SKIPPED: profile provider unavailable")
+        except Exception:
+            pass
+        return
+
+    original_profiles = target._profiles
 
     def profiles(server: dict):
         result = original_profiles(server)
@@ -37,7 +53,6 @@ def install(engine) -> None:
             return result
         configs, username, password = result
         hardened = [_rewrite_gate_profile(config, server) for config in configs]
-        # VPN Gate's current public documentation specifies vpn/vpn.
         username = str(username or "vpn") or "vpn"
         password = str(password or "vpn") or "vpn"
         engine.log(
@@ -46,5 +61,6 @@ def install(engine) -> None:
         )
         return hardened, username, password
 
-    engine._profiles = profiles
+    target._profiles = profiles
+    target._findupto_openvpn_compat = True
     engine._findupto_openvpn_compat = True
