@@ -7,6 +7,7 @@ replacing its OpenVPN implementation. It adds measured history, quarantine,
 and smart ordering without changing the GUI contract.
 """
 
+import sys
 import time
 
 import standalone_engine as engine
@@ -53,6 +54,20 @@ def connect(server: dict, total_deadline: float = 60):
         raise
 
 
-# Patch the already-imported module object used by gui.py.
+# Patch the already-imported module object used by the GUI.
 engine.discover = discover
 engine.connect = connect
+
+# app.py historically imports gui_spinner as its final UI entry point. Keep
+# that contract while routing it to the new connection-first dashboard. The
+# modern dashboard subclasses gui_elite directly, avoiding the old visual
+# hierarchy while retaining the existing engine/session implementation.
+try:
+    from gui_modern import App as ModernApp
+    import types
+
+    modern_module = types.ModuleType("gui_spinner")
+    modern_module.App = ModernApp
+    sys.modules["gui_spinner"] = modern_module
+except Exception as exc:
+    engine.log(f"MODERN GUI BOOTSTRAP FAIL error={type(exc).__name__}: {exc}")
