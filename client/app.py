@@ -11,8 +11,9 @@ import tkinter as tk
 from pathlib import Path
 
 from privacy import redact_log_message
+from session_controller import SessionController
 
-VERSION = "14.2.0"
+VERSION = "14.3.0"
 
 
 def _is_admin() -> bool:
@@ -58,7 +59,7 @@ def _show_startup_error(exc: Exception) -> None:
 
 
 def _install_gui_compatibility() -> None:
-    """Wire the premium GUI to the real OpenVPN engine and browser."""
+    """Wire the premium GUI to the real OpenVPN engine and lifecycle controller."""
     from gui import App as LegacyApp
     import standalone_engine as engine
     from browser_integration import open_secure_browser
@@ -74,50 +75,124 @@ def _install_gui_compatibility() -> None:
         refresh_with_status._findupto_status_compat = True
         LegacyApp.refresh = refresh_with_status
 
+        def _controller(self):
+            controller = getattr(self, "_session_controller", None)
+            if controller is None:
+                controller = SessionController()
+                self._session_controller = controller
+            return controller
+
+        def _set_status(self, message):
+            try:
+                self.events.put(("status", None, message))
+            except Exception:
+                pass
+
+        def _connect_verified(self, server, previous_ip=None):
+            process, work, logfile = engine.connect(server, total_deadline=75)
+            try:
+                vpn_ip = engine.verify_tunnel(previous_ip=previous_ip, timeout=10)
+            except Exception:
+                _controller(self).terminate_process(process)
+                raise
+            return process, work, logfile, vpn_ip
+
         def start_connection(self, server):
-            if getattr(self, "process", None) is not None and self.process.poll() is None:
-                self.events.put(("error", None, "A VPN tunnel is already connected. Disconnect it before changing servers."))
+            controller = _controller(self)
+            if not controller.begin_connect(server):
+                self.events.put(("error", None, "A VPN operation is already in progress. Disconnect or wait for it to finish."))
                 return
 
             def worker():
                 previous_ip = None
                 try:
-                    self.events.put(("status", None, f"Connecting to {server.get('country', 'VPN')} • testing the real tunnel…"))
+                    self.events.put(("status", None, f"Connecting to {server.get('country', 'VPN')} • verifying the real tunnel…"))
                     try:
                         previous_ip = engine.public_ip(timeout=5)
                     except Exception as exc:
                         engine.log(f"PRECONNECT IP CHECK FAILED error={type(exc).__name__}: {exc}")
 
-                    process, work, logfile = engine.connect(server, total_deadline=75)
-                    vpn_ip = engine.verify_tunnel(previous_ip=previous_ip, timeout=10)
+                    process, work, logfile, vpn_ip = _connect_verified(self, server, previous_ip)
                     self.process = process
                     self.tmp = work
                     self.current_log = logfile
                     self.selected_server = server
+                    controller.mark_connected(process, vpn_ip)
                     engine.log(f"GUI VPN CONNECTED host={server.get('host')} vpn_ip={vpn_ip}")
                     self.events.put(("connected", None, f"CONNECTED • {server.get('country', 'VPN')} • exit IP {vpn_ip}"))
                 except Exception as exc:
+                    controller.mark_error()
                     engine.log(f"GUI VPN CONNECTION FAILED host={server.get('host')} error={type(exc).__name__}: {exc}")
                     self.events.put(("error", None, f"VPN connection failed for {server.get('host', 'selected server')}: {exc}"))
 
             threading.Thread(target=worker, daemon=True, name="findupto-vpn-connect").start()
 
         def disconnect(self):
+            controller = _controller(self)
             process = getattr(self, "process", None)
-            if process is not None:
-                try:
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except Exception:
-                            process.kill()
-                except Exception as exc:
-                    engine.log(f"GUI DISCONNECT FAIL error={type(exc).__name__}: {exc}")
+            controller.disconnect(process)
             self.process = None
             self.current_log = None
             self.tmp = None
+            self.selected_server = None
             engine.log("GUI VPN DISCONNECTED")
+            self.events.put(("disconnected", None, "DISCONNECTED • VPN tunnel closed"))
+
+        def change_ip(self):
+            controller = _controller(self)
+            current = getattr(self, "selected_server", None)
+            if not current or controller.state.value != "connected":
+                self.events.put(("error", None, "Connect the VPN first, then use Change IP."))
+                return
+            if not controller.begin_change_ip():
+                self.events.put(("error", None, "Another VPN operation is already in progress."))
+                return
+
+            candidates = controller.alternate_servers(getattr(self, "servers", []), current)
+            if not candidates:
+                controller.mark_error()
+                self.events.put(("error", None, "No alternate verified VPN server is available. Refresh the network and try again."))
+                return
+
+            previous_ip = controller.session.public_ip
+            old_process = getattr(self, "process", None)
+            controller.terminate_process(old_process)
+            self.process = None
+            self.tmp = None
+            self.current_log = None
+
+            def worker():
+                last_error = None
+                for server in candidates[:8]:
+                    controller.mark_change_target(server)
+                    try:
+                        self.events.put(("status", None, f"Changing IP • trying {server.get('country', 'VPN')}…"))
+                        process, work, logfile, vpn_ip = _connect_verified(self, server, previous_ip)
+                        if previous_ip and vpn_ip == previous_ip:
+                            controller.terminate_process(process)
+                            last_error = RuntimeError(f"{server.get('host', 'endpoint')} returned the existing exit IP")
+                            continue
+                        self.process = process
+                        self.tmp = work
+                        self.current_log = logfile
+                        self.selected_server = server
+                        controller.mark_connected(process, vpn_ip)
+                        engine.log(f"GUI VPN IP CHANGED host={server.get('host')} old_ip={previous_ip} new_ip={vpn_ip}")
+                        self.events.put(("connected", None, f"IP CHANGED • {server.get('country', 'VPN')} • new exit IP {vpn_ip}"))
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                        controller.mark_error()
+                        engine.log(f"GUI VPN IP CHANGE FAILED host={server.get('host')} error={type(exc).__name__}: {exc}")
+
+                self.process = None
+                self.selected_server = None
+                message = "Could not obtain a different exit IP. The previous tunnel was closed."
+                if last_error:
+                    message += f" Last error: {last_error}"
+                self.events.put(("error", None, message))
+
+            threading.Thread(target=worker, daemon=True, name="findupto-vpn-change-ip").start()
 
         def open_browser(self):
             process = getattr(self, "process", None)
@@ -132,11 +207,36 @@ def _install_gui_compatibility() -> None:
 
         LegacyApp._start_connection = start_connection
         LegacyApp._disconnect = disconnect
+        LegacyApp._change_ip = change_ip
         LegacyApp._open_browser = open_browser
+        LegacyApp._findupto_session_controller = _controller
         LegacyApp._findupto_runtime_wired = True
 
-    # The production app is gui_spinner -> gui_elite -> gui_pro. Add the browser
-    # launcher to the actual visible elite sidebar and keep it visible at compact widths.
+    # Add a Change IP control to the existing action bar without replacing the
+    # current GUI implementation. This works for the premium GUI subclasses too.
+    try:
+        from gui_elite import App as EliteApp
+        if not getattr(EliteApp, "_findupto_change_ip_ui_wired", False):
+            original_content = EliteApp._build_premium_content
+
+            def content_with_change_ip(self):
+                original_content(self)
+                button = self._button(self.action_bar, "↻  CHANGE IP", self._change_ip, "success")
+                if hasattr(self, "disconnect_btn"):
+                    button.pack(side="right", padx=7, before=self.disconnect_btn)
+                else:
+                    button.pack(side="right", padx=7)
+                self.change_ip_btn = button
+
+            EliteApp._build_premium_content = content_with_change_ip
+            EliteApp._findupto_change_ip_ui_wired = True
+    except Exception as exc:
+        try:
+            engine.log(f"CHANGE IP UI WIRING FAIL error={type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+
+    # Keep the existing premium responsive fix and secure-browser wiring.
     try:
         from gui_elite import App as EliteApp
         if not getattr(EliteApp, "_findupto_browser_ui_wired", False):
@@ -154,13 +254,6 @@ def _install_gui_compatibility() -> None:
                 self.browser_button = button
 
             def resize_with_browser(self, width):
-                """Safe responsive layout: never call pack_forget on child widgets.
-
-                The previous responsive chain could call pack_forget on a widget that
-                had already been re-parented/repacked by the premium UI, producing
-                TclError: '...buttonX isn't packed'. The sidebar is intentionally
-                persistent because it contains the Secure Browser launcher.
-                """
                 try:
                     if not self.sidebar.winfo_ismapped():
                         self.sidebar.pack(side="left", fill="y", before=self.content)
@@ -175,10 +268,7 @@ def _install_gui_compatibility() -> None:
                             widget.pack_configure(padx=pad)
                         except tk.TclError:
                             pass
-                    if width < 900:
-                        self.sidebar.configure(width=210)
-                    else:
-                        self.sidebar.configure(width=244)
+                    self.sidebar.configure(width=210 if width < 900 else 244)
                     try:
                         self.table_hint.configure(text="Scroll horizontally • double-click to connect" if width < 860 else "Live verified endpoints")
                     except tk.TclError:
