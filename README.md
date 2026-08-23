@@ -2,25 +2,20 @@
 
 A lightweight desktop VPN client that discovers live public OpenVPN servers, ranks them, uses multiple transport methods and server endpoints, retries intelligently, and refuses to report success until the tunnel is actually usable.
 
-## v14.0.0
+## v14.3.0
 
-This release adds a first production-hardening batch around the existing VPN engine:
+This release adds connection lifecycle and IP rotation hardening on top of the existing VPN engine:
 
-- durable SQLite persistence for backend server/device metadata;
-- node heartbeats, health thresholds, and stale-node handling;
-- replay-resistant HMAC envelopes for control-plane requests;
-- validated, expiring subscription state;
-- rolling server health scoring with stale-metric expiry;
-- latency, jitter, packet-loss, and bandwidth-aware server scoring;
-- cross-platform DNS resolver configuration verification;
-- public-IP and IPv6 connectivity diagnostics;
-- stronger VPN endpoint and allowed-network validation;
-- deterministic configuration signatures;
-- bounded exponential reconnect backoff with cancellation;
-- temporary server quarantine after repeated failures;
-- privacy-safe startup diagnostic redaction;
-- regression coverage for the new hardening behavior;
-- project license, security policy, contribution rules, issue/PR templates, dependency update automation, and security CI.
+- safe, serialized VPN session state management;
+- idempotent Disconnect with graceful termination and forced-kill fallback;
+- one-click **Change IP** in the desktop command center;
+- alternate endpoint selection that avoids the current server;
+- verified exit-IP rotation: a new connection is not accepted when it returns the previous public IP;
+- automatic retry across multiple alternate verified endpoints;
+- protection against overlapping connect/disconnect/change-IP operations;
+- regression coverage for connect, disconnect, endpoint selection, retry, and IP rotation.
+
+The previous production-hardening features remain enabled, including durable SQLite persistence, node health/staleness handling, replay-resistant control-plane requests, rolling server health scoring, DNS/public-IP diagnostics, deterministic configuration signatures, reconnect backoff, server quarantine, and privacy-safe diagnostics.
 
 ## Supported platforms
 
@@ -50,6 +45,14 @@ Run tests:
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Connection controls
+
+- **Connect:** establishes a tunnel and verifies that the public exit IP changes.
+- **Disconnect:** closes the active OpenVPN process safely and resets local session state.
+- **Change IP:** closes the current tunnel, tries alternate verified endpoints, and accepts a new tunnel only when the public exit IP differs from the previous one.
+
+If no alternate endpoint produces a different exit IP, the operation fails closed instead of claiming that the address changed.
 
 ## Runtime diagnostics
 
